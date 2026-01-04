@@ -25,17 +25,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  APP_NAME: 'birthday-invitation'
-  NODE_VERSION: '20'
-  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-  DEPLOY_PATH: '/var/www/${{ env.APP_NAME }}'
-  BACKUP_PATH: '/var/backups/${{ env.APP_NAME }}'
-  NGINX_SITES_AVAILABLE: '/etc/nginx/sites-available'
-  NGINX_SITES_ENABLED: '/etc/nginx/sites-enabled'
-  NGINX_SITE_NAME: '${{ env.APP_NAME }}'
+# Убираем env блок с переменными которые ссылаются друг на друга
+# Вместо этого используем хардкодинг или вычисляем в steps
 
 jobs:
+  # ==================== VALIDATION ====================
   validate:
     name: 🔍 Validate
     runs-on: ubuntu-latest
@@ -47,6 +41,7 @@ jobs:
       with:
         fetch-depth: 0
 
+  # ==================== SECURITY SCAN ====================
   security:
     name: 🔒 Security Scan
     runs-on: ubuntu-latest
@@ -62,6 +57,7 @@ jobs:
         echo "🛡️ Running dependency audit..."
         npm audit --audit-level=moderate || echo "⚠️ Audit found vulnerabilities"
 
+  # ==================== BUILD ====================
   build:
     name: 🏗️ Build
     runs-on: ubuntu-latest
@@ -78,7 +74,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ env.NODE_VERSION }}
+        node-version: '20'
         cache: 'npm'
     
     - name: Extract version
@@ -120,7 +116,7 @@ jobs:
     - name: Create build manifest
       run: |
         echo "📄 Creating build manifest..."
-        echo '{"application":"'"${{ env.APP_NAME }}"'","version":"'"${{ steps.extract_version.outputs.version }}"'","buildId":"'"${{ steps.generate_build_id.outputs.build_id }}"'","commitSha":"'"${{ github.sha }}"'","branch":"'"${{ github.ref_name }}"'","builtAt":"'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"}' > dist/build-manifest.json
+        echo '{"application":"birthday-invitation","version":"'"${{ steps.extract_version.outputs.version }}"'","buildId":"'"${{ steps.generate_build_id.outputs.build_id }}"'","commitSha":"'"${{ github.sha }}"'","branch":"'"${{ github.ref_name }}"'","builtAt":"'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"}' > dist/build-manifest.json
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
@@ -129,15 +125,13 @@ jobs:
         path: dist/
         retention-days: 30
 
+  # ==================== DEPLOY ====================
   deploy:
     name: 🚀 Deploy to Production
     runs-on: ubuntu-latest
     needs: [build]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
-    environment: 
-      name: production
-      url: https://${{ secrets.DOMAIN }}
     
     steps:
     - name: Download build artifacts
@@ -155,7 +149,7 @@ jobs:
         cat >> ~/.ssh/config << 'EOF'
         Host deploy-server
           HostName ${{ secrets.SERVER_IP }}
-          User ${{ env.DEPLOY_USER }}
+          User ${{ secrets.DEPLOY_USER }}
           IdentityFile ~/.ssh/deploy_key
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
@@ -168,15 +162,23 @@ jobs:
         echo "🔍 Testing server connection..."
         ssh deploy-server "echo '✅ Connected!'"
     
+    - name: Define deployment variables
+      id: vars
+      run: |
+        echo "APP_NAME=birthday-invitation" >> $GITHUB_OUTPUT
+        echo "DEPLOY_PATH=/var/www/birthday-invitation" >> $GITHUB_OUTPUT
+        echo "BACKUP_PATH=/var/backups/birthday-invitation" >> $GITHUB_OUTPUT
+        echo "NGINX_SITE_NAME=birthday-invitation" >> $GITHUB_OUTPUT
+    
     - name: Create backup
       run: |
         echo "💾 Creating backup..."
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
         
         ssh deploy-server "
-          sudo mkdir -p ${{ env.BACKUP_PATH }}
-          if [ -d '${{ env.DEPLOY_PATH }}/dist' ]; then
-            sudo tar -czf '${{ env.BACKUP_PATH }}/backup_$TIMESTAMP.tar.gz' -C '${{ env.DEPLOY_PATH }}' dist/
+          sudo mkdir -p /var/backups/birthday-invitation
+          if [ -d '/var/www/birthday-invitation/dist' ]; then
+            sudo tar -czf '/var/backups/birthday-invitation/backup_$TIMESTAMP.tar.gz' -C '/var/www/birthday-invitation' dist/
             echo '✅ Backup created'
           else
             echo '⚠️ No existing deployment'
@@ -187,20 +189,20 @@ jobs:
       run: |
         echo "📁 Preparing directory..."
         ssh deploy-server "
-          sudo mkdir -p '${{ env.DEPLOY_PATH }}'
-          sudo chown -R '${{ env.DEPLOY_USER }}:${{ env.DEPLOY_USER }}' '${{ env.DEPLOY_PATH }}'
-          mkdir -p '${{ env.DEPLOY_PATH }}/dist'
+          sudo mkdir -p '/var/www/birthday-invitation'
+          sudo chown -R '${{ secrets.DEPLOY_USER }}:${{ secrets.DEPLOY_USER }}' '/var/www/birthday-invitation'
+          mkdir -p '/var/www/birthday-invitation/dist'
         "
     
     - name: Deploy files
       run: |
         echo "📤 Deploying files..."
-        scp -r dist/* deploy-server:'${{ env.DEPLOY_PATH }}/dist/'
+        scp -r dist/* deploy-server:'/var/www/birthday-invitation/dist/'
         
         ssh deploy-server "
-          sudo chown -R www-data:www-data '${{ env.DEPLOY_PATH }}/dist'
-          sudo find '${{ env.DEPLOY_PATH }}/dist' -type f -exec chmod 644 {} \;
-          sudo find '${{ env.DEPLOY_PATH }}/dist' -type d -exec chmod 755 {} \;
+          sudo chown -R www-data:www-data '/var/www/birthday-invitation/dist'
+          sudo find '/var/www/birthday-invitation/dist' -type f -exec chmod 644 {} \;
+          sudo find '/var/www/birthday-invitation/dist' -type d -exec chmod 755 {} \;
           echo '✅ Files deployed'
         "
     
@@ -209,8 +211,7 @@ jobs:
         echo "⚙️ Configuring Nginx..."
         
         # Создаем простой nginx конфиг
-        NGINX_CONFIG=$(cat <<-EOF
-        server {
+        NGINX_CONFIG="server {
             listen 80;
             server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
             return 301 https://\$server_name\$request_uri;
@@ -221,10 +222,10 @@ jobs:
             listen [::]:443 ssl http2;
             server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
             
-            ssl_certificate /etc/ssl/certs/${{ env.APP_NAME }}.crt;
-            ssl_certificate_key /etc/ssl/private/${{ env.APP_NAME }}.key;
+            ssl_certificate /etc/ssl/certs/birthday-invitation.crt;
+            ssl_certificate_key /etc/ssl/private/birthday-invitation.key;
             
-            root ${{ env.DEPLOY_PATH }}/dist;
+            root /var/www/birthday-invitation/dist;
             index index.html;
             
             location / {
@@ -233,18 +234,16 @@ jobs:
             
             location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
                 expires 1y;
-                add_header Cache-Control "public, immutable";
+                add_header Cache-Control \"public, immutable\";
             }
-        }
-        EOF
-        )
+        }"
         
         echo "$NGINX_CONFIG" > nginx.conf
         scp nginx.conf deploy-server:/tmp/nginx.conf
         
         ssh deploy-server "
-          sudo cp /tmp/nginx.conf '${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}'
-          sudo ln -sf '${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}' '${{ env.NGINX_SITES_ENABLED }}/'
+          sudo cp /tmp/nginx.conf /etc/nginx/sites-available/birthday-invitation
+          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
           sudo nginx -t && sudo systemctl reload nginx
           echo '✅ Nginx configured'
         "
@@ -266,6 +265,7 @@ jobs:
         
         echo "🌐 Application available at: https://${{ secrets.DOMAIN }}"
 
+  # ==================== NOTIFICATION ====================
   notify:
     name: 📨 Notify
     runs-on: ubuntu-latest
@@ -296,22 +296,17 @@ jobs:
           STATUS="⚠️ ОШИБКА"
         fi
         
-        # Создаем JSON для Telegram
-        JSON_PAYLOAD=$(cat <<-EOF
-        {
-          "chat_id": "${{ secrets.TELEGRAM_CHAT_ID }}",
-          "text": "${EMOJI} <b>Деплой завершен</b>\n\n${STATUS}\n📦 Версия: ${{ needs.build.outputs.version }}\n🏷️ Сборка: ${{ needs.build.outputs.build_id }}\n\n📝 Информация:\n• Ветка: ${BRANCH}\n• Коммит: ${COMMIT_SHA}\n• Автор: ${COMMIT_AUTHOR}\n\n🌐 Приложение доступно:\nhttps://${{ secrets.DOMAIN }}\n\n🕐 $(date '+%d.%m.%Y %H:%M')",
-          "parse_mode": "HTML"
-        }
-        EOF
-        )
+        # Создаем сообщение
+        MESSAGE="${EMOJI} <b>Деплой завершен</b>\n\n${STATUS}\n📦 Версия: ${{ needs.build.outputs.version }}\n🏷️ Сборка: ${{ needs.build.outputs.build_id }}\n\n📝 Информация:\n• Ветка: ${BRANCH}\n• Коммит: ${COMMIT_SHA}\n• Автор: ${COMMIT_AUTHOR}\n\n🌐 Приложение доступно:\nhttps://${{ secrets.DOMAIN }}\n\n🕐 $(date '+%d.%m.%Y %H:%M')"
         
+        # Отправляем в Telegram
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
-          -d "$JSON_PAYLOAD"
+          -d "{\"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\": \"$MESSAGE\", \"parse_mode\": \"HTML\"}"
         
         echo "✅ Notification sent"
 
+  # ==================== CLEANUP ====================
   cleanup:
     name: 🧹 Cleanup
     runs-on: ubuntu-latest
@@ -323,7 +318,7 @@ jobs:
       run: |
         echo "📋 ===== SUMMARY ====="
         echo ""
-        echo "🏗️ Application: ${{ env.APP_NAME }}"
+        echo "🏗️ Application: birthday-invitation"
         echo "📊 Results:"
         echo "  🔍 Validate: ${{ needs.validate.result }}"
         echo "  🔒 Security: ${{ needs.security.result }}"
