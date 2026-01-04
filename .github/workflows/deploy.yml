@@ -3,92 +3,41 @@ name: Deploy to VPS
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:  # Позволяет запускать вручную
-    inputs:
-      environment:
-        description: 'Environment to deploy to'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
+  workflow_dispatch:
 
-env:
-  APP_NAME: birthday-invitation
-  NODE_VERSION: '18'
-  
 jobs:
-  test-and-build:
+  deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-    
-    - name: Install dependencies
-      run: npm ci
-    
-    - name: Build for production
-      run: |
-        echo "Building with environment variables..."
-        VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
-        VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-        npm run build
-        
-        echo "Build completed!"
-        ls -la dist/
-    
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-artifacts
-        path: |
-          dist/
-          package.json
-        retention-days: 7
-
-  deploy-production:
-    needs: test-and-build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-    
-    steps:
-    - name: Download build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: build-artifacts
-    
     - name: Setup SSH
       run: |
         mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/github_actions
+        chmod 600 ~/.ssh/github_actions
         
-        # Создаем SSH конфиг
+        # Создаем config файл
         cat >> ~/.ssh/config << EOF
         Host deploy-server
           HostName ${{ secrets.SERVER_IP }}
           User ${{ secrets.DEPLOY_USER }}
-          IdentityFile ~/.ssh/id_rsa
+          IdentityFile ~/.ssh/github_actions
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
         EOF
         
         chmod 600 ~/.ssh/config
+        
+        # Проверяем что ключ сохранен
+        ls -la ~/.ssh/
     
     - name: Test SSH connection
       run: |
-        echo "Testing SSH connection to ${{ secrets.SERVER_IP }}..."
-        ssh deploy-server "echo '✅ SSH connection successful!'"
+        echo "🔍 Тестируем SSH подключение..."
+        ssh -v deploy-server "echo '✅ SSH connection successful!'; whoami; pwd"
     
     - name: Create environment file on server
       run: |
