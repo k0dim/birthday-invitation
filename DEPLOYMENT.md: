@@ -1,0 +1,24 @@
+# Настройка CI/CD с Telegram переменными
+
+## 1. Добавьте Secrets в GitHub
+
+В Settings → Secrets and variables → Actions добавьте:
+
+| Secret Name | Value | Как получить |
+|-------------|-------|-------------|
+| `TELEGRAM_BOT_TOKEN` | `1234567890:ABC...` | @BotFather в Telegram |
+| `TELEGRAM_CHAT_ID` | `987654321` | @getmyid_bot в Telegram |
+| `SERVER_IP` | `123.123.123.123` | IP вашего VPS |
+| `DOMAIN` | `birthday.your-domain.com` | Ваш домен |
+| `DEPLOY_USER` | `deploy` | Пользователь на сервере |
+| `SSH_PRIVATE_KEY` | `-----BEGIN RSA...` | SSH приватный ключ |
+
+## 2. Для локальной разработки
+
+```bash
+# Установите локальные переменные
+npm run setup-env
+
+# Или создайте .env.local вручную
+cp .env.example .env.local
+# Отредактируйте .env.local

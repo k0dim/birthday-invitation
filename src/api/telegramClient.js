@@ -1,14 +1,37 @@
 // Telegram Bot API клиент
+// Переменные загружаются через import.meta.env в Vite
+
 const TELEGRAM_BOT_TOKEN = import.meta.env.VITE_TELEGRAM_BOT_TOKEN || ''
 const TELEGRAM_CHAT_ID = import.meta.env.VITE_TELEGRAM_CHAT_ID || ''
 
+// Функция для логирования (только в development)
+const logDebug = (message, data = null) => {
+  if (import.meta.env.DEV) {
+    console.log(`[Telegram Client] ${message}`, data || '')
+  }
+}
+
 export const telegramClient = {
+  // Проверка конфигурации
+  isConfigured() {
+    const hasToken = !!TELEGRAM_BOT_TOKEN
+    const hasChatId = !!TELEGRAM_CHAT_ID
+    
+    logDebug('Configuration check:', {
+      hasToken,
+      hasChatId,
+      tokenLength: TELEGRAM_BOT_TOKEN?.length || 0,
+      env: import.meta.env.MODE
+    })
+    
+    return hasToken && hasChatId
+  },
+
   // Отправка сообщения в Telegram
   async sendMessage(message) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      console.warn('Telegram bot token or chat ID not configured')
-      console.log('Mock message:', message)
-      return { ok: true } // Возвращаем успех для разработки
+    if (!this.isConfigured()) {
+      logDebug('Telegram bot not configured. Mocking send message:', message)
+      return { ok: true, mocked: true }
     }
 
     try {
@@ -25,6 +48,12 @@ export const telegramClient = {
       })
 
       const data = await response.json()
+      logDebug('Telegram API response:', data)
+      
+      if (!data.ok) {
+        throw new Error(data.description || 'Telegram API error')
+      }
+      
       return data
     } catch (error) {
       console.error('Error sending Telegram message:', error)
@@ -54,17 +83,29 @@ export const telegramClient = {
 
   // Проверка доступности бота
   async checkBotAvailability() {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      return { ok: false, error: 'Bot not configured' }
+    if (!this.isConfigured()) {
+      return { 
+        ok: false, 
+        error: 'Bot not configured',
+        configured: false 
+      }
     }
 
     try {
       const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe`)
       const data = await response.json()
-      return data
+      
+      return {
+        ...data,
+        configured: true
+      }
     } catch (error) {
       console.error('Error checking bot availability:', error)
-      return { ok: false, error: error.message }
+      return { 
+        ok: false, 
+        error: error.message,
+        configured: true 
+      }
     }
   }
 }

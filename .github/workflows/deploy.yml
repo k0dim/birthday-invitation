@@ -1,0 +1,224 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Позволяет запускать вручную
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  APP_NAME: birthday-invitation
+  NODE_VERSION: '18'
+  
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build for production
+      run: |
+        echo "Building with environment variables..."
+        VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+        VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+        npm run build
+        
+        echo "Build completed!"
+        ls -la dist/
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          dist/
+          package.json
+        retention-days: 7
+
+  deploy-production:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+    
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        # Создаем SSH конфиг
+        cat >> ~/.ssh/config << EOF
+        Host deploy-server
+          HostName ${{ secrets.SERVER_IP }}
+          User ${{ secrets.DEPLOY_USER }}
+          IdentityFile ~/.ssh/id_rsa
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+        EOF
+        
+        chmod 600 ~/.ssh/config
+    
+    - name: Test SSH connection
+      run: |
+        echo "Testing SSH connection to ${{ secrets.SERVER_IP }}..."
+        ssh deploy-server "echo '✅ SSH connection successful!'"
+    
+    - name: Create environment file on server
+      run: |
+        echo "Creating .env.production on server..."
+        
+        # Создаем .env.production с секретами
+        cat > .env.production << EOF
+        NODE_ENV=production
+        VITE_BASE_URL=/
+        VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+        VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+        EOF
+        
+        # Копируем на сервер
+        scp .env.production deploy-server:/tmp/.env.production
+        rm .env.production
+    
+    - name: Deploy to server
+      run: |
+        echo "🚀 Starting deployment to production..."
+        
+        # 1. Создаем структуру папок на сервере
+        ssh deploy-server "
+          echo 'Creating directory structure...'
+          sudo mkdir -p /var/www/${{ env.APP_NAME }}
+          sudo chown -R ${{ secrets.DEPLOY_USER }}:${{ secrets.DEPLOY_USER }} /var/www/${{ env.APP_NAME }}
+          
+          # 2. Копируем .env.production в безопасное место
+          sudo mv /tmp/.env.production /var/www/${{ env.APP_NAME }}/.env.production
+          sudo chmod 600 /var/www/${{ env.APP_NAME }}/.env.production
+        "
+        
+        # 3. Копируем build artifacts
+        echo "Copying build files..."
+        rsync -avz \
+          --exclude node_modules \
+          --exclude .git \
+          --exclude .env.local \
+          --exclude .env.development \
+          ./ deploy-server:/var/www/${{ env.APP_NAME }}/
+        
+        # 4. Настраиваем приложение на сервере
+        ssh deploy-server "
+          cd /var/www/${{ env.APP_NAME }}
+          
+          echo 'Setting up nginx configuration...'
+          sudo mkdir -p /etc/nginx/ssl
+          
+          # Копируем SSL сертификаты если есть
+          if [ -f infra/ssl/selfsigned.crt ]; then
+            sudo cp infra/ssl/selfsigned.crt /etc/nginx/ssl/
+            sudo cp infra/ssl/selfsigned.key /etc/nginx/ssl/
+            sudo chmod 600 /etc/nginx/ssl/selfsigned.key
+          fi
+          
+          # Копируем nginx конфиг
+          if [ -f infra/nginx/ssl.conf ]; then
+            sudo cp infra/nginx/ssl.conf /etc/nginx/sites-available/${{ env.APP_NAME }}
+            
+            # Заменяем домен в конфиге
+            sudo sed -i 's/your-domain.com/${{ secrets.DOMAIN }}/g' /etc/nginx/sites-available/${{ env.APP_NAME }}
+            sudo sed -i 's/birthday.your-domain.com/${{ secrets.DOMAIN }}/g' /etc/nginx/sites-available/${{ env.APP_NAME }}
+            
+            sudo ln -sf /etc/nginx/sites-available/${{ env.APP_NAME }} /etc/nginx/sites-enabled/
+          else
+            echo '⚠️  No nginx config found, using default'
+          fi
+          
+          echo 'Testing nginx configuration...'
+          sudo nginx -t || exit 1
+          
+          echo 'Reloading nginx...'
+          sudo systemctl reload nginx
+          
+          echo 'Checking application...'
+          ls -la dist/
+          
+          echo '✅ Deployment completed successfully!'
+        "
+        
+        echo "🌐 Application should be available at: https://${{ secrets.DOMAIN }}"
+    
+    - name: Verify deployment
+      run: |
+        echo "Verifying deployment..."
+        
+        # Даем nginx время перезагрузиться
+        sleep 5
+        
+        # Проверяем доступность приложения
+        curl -f -I https://${{ secrets.DOMAIN }} || echo "⚠️  Application not responding yet, might need a moment..."
+        
+        ssh deploy-server "
+          echo 'Server status:'
+          echo '--- nginx status ---'
+          sudo systemctl status nginx --no-pager | head -20
+          echo '--- disk usage ---'
+          df -h /var/www
+          echo '--- app directory ---'
+          ls -la /var/www/${{ env.APP_NAME }}/dist/ | head -10
+        "
+
+  notify:
+    needs: [test-and-build, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Send Telegram notification
+      run: |
+        DEPLOY_STATUS="${{ needs.deploy-production.result || 'unknown' }}"
+        COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+        
+        if [ "$DEPLOY_STATUS" = "success" ]; then
+          EMOJI="✅"
+          STATUS_TEXT="успешно"
+        else
+          EMOJI="❌"
+          STATUS_TEXT="с ошибкой"
+        fi
+        
+        # Отправляем уведомление в Telegram
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+            \"text\": \"${EMOJI} <b>GitHub Actions Deploy</b>\n\nСтатус: ${STATUS_TEXT}\nВетка: ${{ github.ref_name }}\nКоммит: ${COMMIT_MESSAGE}\nАвтор: ${COMMIT_AUTHOR}\n\nСсылка: https://${{ secrets.DOMAIN }}\",
+            \"parse_mode\": \"HTML\",
+            \"disable_web_page_preview\": true
+          }"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
