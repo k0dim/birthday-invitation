@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => {
   
   return {
     plugins: [react()],
-    base: '/birthday-invite/',
+    base: '/birthday-invitation/',
     define: {
       // Делаем env переменные доступными в коде
       'process.env': env
