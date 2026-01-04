@@ -3,41 +3,83 @@ name: Deploy to VPS
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:  # Позволяет запускать вручную
 
+env:
+  APP_NAME: birthday-invitation
+  NODE_VERSION: '18'
+  
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build for production
+      run: |
+        echo "Building with environment variables..."
+        VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+        VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+        npm run build
+        
+        echo "Build completed!"
+        ls -la dist/
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          dist/
+          package.json
+        retention-days: 7
+
+  deploy:
+    needs: build  # Зависит от job 'build'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+    
     - name: Setup SSH
       run: |
         mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/github_actions
-        chmod 600 ~/.ssh/github_actions
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
         
-        # Создаем config файл
+        # Создаем SSH конфиг
         cat >> ~/.ssh/config << EOF
         Host deploy-server
           HostName ${{ secrets.SERVER_IP }}
           User ${{ secrets.DEPLOY_USER }}
-          IdentityFile ~/.ssh/github_actions
+          IdentityFile ~/.ssh/id_rsa
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
         EOF
         
         chmod 600 ~/.ssh/config
-        
-        # Проверяем что ключ сохранен
-        ls -la ~/.ssh/
     
     - name: Test SSH connection
       run: |
-        echo "🔍 Тестируем SSH подключение..."
-        ssh -v deploy-server "echo '✅ SSH connection successful!'; whoami; pwd"
+        echo "Testing SSH connection to ${{ secrets.SERVER_IP }}..."
+        ssh deploy-server "echo '✅ SSH connection successful!'"
     
     - name: Create environment file on server
       run: |
@@ -141,23 +183,31 @@ jobs:
         "
 
   notify:
-    needs: [test-and-build, deploy-production]
-    if: always()
+    needs: [build, deploy]  # Зависит от jobs 'build' и 'deploy'
+    if: always()  # Всегда запускается, даже если предыдущие jobs упали
     runs-on: ubuntu-latest
     
     steps:
     - name: Send Telegram notification
       run: |
-        DEPLOY_STATUS="${{ needs.deploy-production.result || 'unknown' }}"
-        COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+        BUILD_STATUS="${{ needs.build.result || 'unknown' }}"
+        DEPLOY_STATUS="${{ needs.deploy.result || 'unknown' }}"
+        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n 1)
         COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+        COMMIT_HASH=$(git log -1 --pretty=%h)
         
-        if [ "$DEPLOY_STATUS" = "success" ]; then
+        if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
           EMOJI="✅"
           STATUS_TEXT="успешно"
         else
           EMOJI="❌"
           STATUS_TEXT="с ошибкой"
+          
+          if [ "$BUILD_STATUS" != "success" ]; then
+            STATUS_TEXT="ошибка сборки"
+          elif [ "$DEPLOY_STATUS" != "success" ]; then
+            STATUS_TEXT="ошибка деплоя"
+          fi
         fi
         
         # Отправляем уведомление в Telegram
@@ -165,9 +215,7 @@ jobs:
           -H "Content-Type: application/json" \
           -d "{
             \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-            \"text\": \"${EMOJI} <b>GitHub Actions Deploy</b>\n\nСтатус: ${STATUS_TEXT}\nВетка: ${{ github.ref_name }}\nКоммит: ${COMMIT_MESSAGE}\nАвтор: ${COMMIT_AUTHOR}\n\nСсылка: https://${{ secrets.DOMAIN }}\",
+            \"text\": \"${EMOJI} <b>GitHub Actions Deploy</b>\n\nСтатус: ${STATUS_TEXT}\nВетка: ${{ github.ref_name }}\nКоммит: ${COMMIT_MESSAGE}\nАвтор: ${COMMIT_AUTHOR}\nХэш: ${COMMIT_HASH}\n\nСсылка: https://${{ secrets.DOMAIN }}\",
             \"parse_mode\": \"HTML\",
             \"disable_web_page_preview\": true
           }"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
