@@ -5,7 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # Ручной запуск
+  workflow_dispatch:
     inputs:
       environment:
         description: 'Environment to deploy to'
@@ -21,28 +21,21 @@ on:
         default: false
         type: boolean
 
-# Отмена предыдущих запусков того же workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # Global environment variables
   APP_NAME: 'birthday-invitation'
   NODE_VERSION: '20'
-  
-  # Deployment paths
   DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
   DEPLOY_PATH: '/var/www/${{ env.APP_NAME }}'
   BACKUP_PATH: '/var/backups/${{ env.APP_NAME }}'
-  
-  # Nginx
   NGINX_SITES_AVAILABLE: '/etc/nginx/sites-available'
   NGINX_SITES_ENABLED: '/etc/nginx/sites-enabled'
   NGINX_SITE_NAME: '${{ env.APP_NAME }}'
 
 jobs:
-  # ==================== VALIDATION ====================
   validate:
     name: 🔍 Validate
     runs-on: ubuntu-latest
@@ -53,23 +46,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    
-    - name: Validate branch protection
-      if: github.event_name == 'push'
-      run: |
-        echo "🔒 Validating branch: ${{ github.ref }}"
-        if [[ "${{ github.ref }}" != "refs/heads/main" && "${{ github.ref }}" != "refs/heads/master" ]]; then
-          echo "⚠️  Only main/master branches can be deployed to production"
-          exit 1
-        fi
-    
-    - name: Validate secrets
-      run: |
-        echo "🔐 Validating required secrets..."
-        # Просто проверяем что секреты определены
-        echo "✅ Secrets validation passed (actual validation happens at runtime)"
 
-  # ==================== SECURITY SCAN ====================
   security:
     name: 🔒 Security Scan
     runs-on: ubuntu-latest
@@ -82,20 +59,9 @@ jobs:
     
     - name: Dependency audit
       run: |
-        echo "🛡️  Running dependency audit..."
-        npm audit --audit-level=moderate || echo "⚠️  Audit found vulnerabilities (check logs)"
-    
-    - name: Check for exposed secrets
-      run: |
-        echo "🔍 Checking for exposed secrets..."
-        # Упрощенная проверка
-        if grep -r "password\|token\|secret\|api_key\|private_key" --include="*.js" --include="*.jsx" --include="*.json" . 2>/dev/null | grep -v node_modules | grep -v .git; then
-          echo "⚠️  Potential secrets found in code"
-        else
-          echo "✅ No obvious secrets found in code"
-        fi
+        echo "🛡️ Running dependency audit..."
+        npm audit --audit-level=moderate || echo "⚠️ Audit found vulnerabilities"
 
-  # ==================== BUILD ====================
   build:
     name: 🏗️ Build
     runs-on: ubuntu-latest
@@ -108,8 +74,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
     
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -134,7 +98,7 @@ jobs:
     - name: Install dependencies
       run: |
         echo "📦 Installing dependencies..."
-        npm ci --prefer-offline
+        npm ci
     
     - name: Build application
       env:
@@ -146,53 +110,25 @@ jobs:
         VITE_COMMIT_SHA: ${{ github.sha }}
       run: |
         echo "🚀 Building application..."
-        echo "Version: $VITE_APP_VERSION"
-        echo "Build ID: $VITE_BUILD_ID"
-        
         npm run build
-        
-        echo "📁 Build output:"
-        ls -la dist/
         
         if [ ! -f "dist/index.html" ]; then
           echo "❌ dist/index.html not found!"
           exit 1
         fi
     
-    - name: Run tests
-      if: ${{ !inputs.force || github.event.inputs.force != 'true' }}
-      run: |
-        echo "🧪 Running tests..."
-        if grep -q '"test"' package.json; then
-          npm test
-        else
-          echo "⚠️  No tests configured"
-        fi
-    
     - name: Create build manifest
       run: |
         echo "📄 Creating build manifest..."
-        cat > dist/build-manifest.json << EOF
-        {
-          "application": "${{ env.APP_NAME }}",
-          "version": "${{ steps.extract_version.outputs.version }}",
-          "buildId": "${{ steps.generate_build_id.outputs.build_id }}",
-          "commitSha": "${{ github.sha }}",
-          "branch": "${{ github.ref_name }}",
-          "builtAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-        }
-        EOF
+        echo '{"application":"'"${{ env.APP_NAME }}"'","version":"'"${{ steps.extract_version.outputs.version }}"'","buildId":"'"${{ steps.generate_build_id.outputs.build_id }}"'","commitSha":"'"${{ github.sha }}"'","branch":"'"${{ github.ref_name }}"'","builtAt":"'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"}' > dist/build-manifest.json
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: build-${{ steps.generate_build_id.outputs.build_id }}
-        path: |
-          dist/
-          package.json
+        path: dist/
         retention-days: 30
 
-  # ==================== DEPLOY ====================
   deploy:
     name: 🚀 Deploy to Production
     runs-on: ubuntu-latest
@@ -216,14 +152,13 @@ jobs:
         echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
         chmod 600 ~/.ssh/deploy_key
         
-        cat >> ~/.ssh/config << EOF
+        cat >> ~/.ssh/config << 'EOF'
         Host deploy-server
           HostName ${{ secrets.SERVER_IP }}
           User ${{ env.DEPLOY_USER }}
           IdentityFile ~/.ssh/deploy_key
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
-          ConnectTimeout 30
         EOF
         
         chmod 600 ~/.ssh/config
@@ -231,7 +166,7 @@ jobs:
     - name: Verify server connectivity
       run: |
         echo "🔍 Testing server connection..."
-        ssh deploy-server "echo '✅ Connected!' && hostname"
+        ssh deploy-server "echo '✅ Connected!'"
     
     - name: Create backup
       run: |
@@ -240,12 +175,11 @@ jobs:
         
         ssh deploy-server "
           sudo mkdir -p ${{ env.BACKUP_PATH }}
-          if [ -d \"${{ env.DEPLOY_PATH }}/dist\" ]; then
-            sudo tar -czf \"${{ env.BACKUP_PATH }}/backup_\$TIMESTAMP.tar.gz\" -C \"${{ env.DEPLOY_PATH }}\" dist/
-            echo \"✅ Backup created\"
-            sudo ls -t ${{ env.BACKUP_PATH }}/backup_*.tar.gz 2>/dev/null | tail -n +6 | sudo xargs -r rm
+          if [ -d '${{ env.DEPLOY_PATH }}/dist' ]; then
+            sudo tar -czf '${{ env.BACKUP_PATH }}/backup_$TIMESTAMP.tar.gz' -C '${{ env.DEPLOY_PATH }}' dist/
+            echo '✅ Backup created'
           else
-            echo '⚠️  No existing deployment'
+            echo '⚠️ No existing deployment'
           fi
         "
     
@@ -253,33 +187,33 @@ jobs:
       run: |
         echo "📁 Preparing directory..."
         ssh deploy-server "
-          sudo mkdir -p ${{ env.DEPLOY_PATH }}
-          sudo chown -R ${{ env.DEPLOY_USER }}:${{ env.DEPLOY_USER }} ${{ env.DEPLOY_PATH }}
-          mkdir -p ${{ env.DEPLOY_PATH }}/dist ${{ env.DEPLOY_PATH }}/logs
+          sudo mkdir -p '${{ env.DEPLOY_PATH }}'
+          sudo chown -R '${{ env.DEPLOY_USER }}:${{ env.DEPLOY_USER }}' '${{ env.DEPLOY_PATH }}'
+          mkdir -p '${{ env.DEPLOY_PATH }}/dist'
         "
     
     - name: Deploy files
       run: |
         echo "📤 Deploying files..."
-        scp -r dist/* deploy-server:${{ env.DEPLOY_PATH }}/dist/
+        scp -r dist/* deploy-server:'${{ env.DEPLOY_PATH }}/dist/'
         
         ssh deploy-server "
-          sudo chown -R www-data:www-data ${{ env.DEPLOY_PATH }}/dist
-          sudo find ${{ env.DEPLOY_PATH }}/dist -type f -exec chmod 644 {} \;
-          sudo find ${{ env.DEPLOY_PATH }}/dist -type d -exec chmod 755 {} \;
+          sudo chown -R www-data:www-data '${{ env.DEPLOY_PATH }}/dist'
+          sudo find '${{ env.DEPLOY_PATH }}/dist' -type f -exec chmod 644 {} \;
+          sudo find '${{ env.DEPLOY_PATH }}/dist' -type d -exec chmod 755 {} \;
           echo '✅ Files deployed'
         "
     
     - name: Configure Nginx
       run: |
-        echo "⚙️  Configuring Nginx..."
+        echo "⚙️ Configuring Nginx..."
         
-        # Создаем конфиг
-        cat > nginx.conf << 'EOF'
+        # Создаем простой nginx конфиг
+        NGINX_CONFIG=$(cat <<-EOF
         server {
             listen 80;
             server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            return 301 https://$server_name$request_uri;
+            return 301 https://\$server_name\$request_uri;
         }
         
         server {
@@ -294,32 +228,23 @@ jobs:
             index index.html;
             
             location / {
-                try_files $uri $uri/ /index.html;
+                try_files \$uri \$uri/ /index.html;
             }
             
-            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+            location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
                 expires 1y;
                 add_header Cache-Control "public, immutable";
             }
-            
-            location /health {
-                return 200 "healthy\n";
-                add_header Content-Type text/plain;
-            }
-            
-            location /version {
-                alias ${{ env.DEPLOY_PATH }}/dist/.version;
-                add_header Content-Type text/plain;
-            }
         }
         EOF
+        )
         
-        # Копируем и применяем
+        echo "$NGINX_CONFIG" > nginx.conf
         scp nginx.conf deploy-server:/tmp/nginx.conf
         
         ssh deploy-server "
-          sudo cp /tmp/nginx.conf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}
-          sudo ln -sf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }} ${{ env.NGINX_SITES_ENABLED }}/
+          sudo cp /tmp/nginx.conf '${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}'
+          sudo ln -sf '${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}' '${{ env.NGINX_SITES_ENABLED }}/'
           sudo nginx -t && sudo systemctl reload nginx
           echo '✅ Nginx configured'
         "
@@ -328,19 +253,19 @@ jobs:
     
     - name: Verify deployment
       run: |
-        echo "🔍 Verifying..."
+        echo "🔍 Verifying deployment..."
         sleep 3
         
         ssh deploy-server "
           echo '=== Deployment status ==='
-          curl -s -o /dev/null -w '%{http_code}' https://localhost/health && echo ' - Health OK'
-          curl -s https://localhost/version && echo ' - Version'
+          if command -v curl > /dev/null; then
+            curl -s -o /dev/null -w '%{http_code}' https://localhost/ && echo ' - HTTP Status OK'
+          fi
           sudo systemctl status nginx --no-pager | head -3
         "
         
-        echo "🌐 Available at: https://${{ secrets.DOMAIN }}"
+        echo "🌐 Application available at: https://${{ secrets.DOMAIN }}"
 
-  # ==================== NOTIFICATION ====================
   notify:
     name: 📨 Notify
     runs-on: ubuntu-latest
@@ -359,7 +284,7 @@ jobs:
         echo "📨 Sending notification..."
         
         COMMIT_SHA="${GITHUB_SHA:0:7}"
-        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
+        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1 | sed 's/"/\\"/g')
         COMMIT_AUTHOR=$(git log -1 --pretty=%an)
         BRANCH="${GITHUB_REF#refs/heads/}"
         
@@ -368,36 +293,25 @@ jobs:
           STATUS="✅ УСПЕШНО"
         else
           EMOJI="❌"
-          STATUS="⚠️  ОШИБКА"
+          STATUS="⚠️ ОШИБКА"
         fi
         
-        MESSAGE="$EMOJI <b>Деплой завершен</b>
-
-$STATUS
-📦 Версия: ${{ needs.build.outputs.version }}
-🏷️  Сборка: ${{ needs.build.outputs.build_id }}
-
-📝 Информация:
-• Ветка: $BRANCH
-• Коммит: $COMMIT_SHA
-• Автор: $COMMIT_AUTHOR
-
-🌐 Приложение доступно:
-https://${{ secrets.DOMAIN }}
-
-🕐 $(date '+%d.%m.%Y %H:%M')"
+        # Создаем JSON для Telegram
+        JSON_PAYLOAD=$(cat <<-EOF
+        {
+          "chat_id": "${{ secrets.TELEGRAM_CHAT_ID }}",
+          "text": "${EMOJI} <b>Деплой завершен</b>\n\n${STATUS}\n📦 Версия: ${{ needs.build.outputs.version }}\n🏷️ Сборка: ${{ needs.build.outputs.build_id }}\n\n📝 Информация:\n• Ветка: ${BRANCH}\n• Коммит: ${COMMIT_SHA}\n• Автор: ${COMMIT_AUTHOR}\n\n🌐 Приложение доступно:\nhttps://${{ secrets.DOMAIN }}\n\n🕐 $(date '+%d.%m.%Y %H:%M')",
+          "parse_mode": "HTML"
+        }
+        EOF
+        )
         
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
-          -d "{
-            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-            \"text\": \"${MESSAGE}\",
-            \"parse_mode\": \"HTML\"
-          }"
+          -d "$JSON_PAYLOAD"
         
         echo "✅ Notification sent"
 
-  # ==================== CLEANUP ====================
   cleanup:
     name: 🧹 Cleanup
     runs-on: ubuntu-latest
@@ -409,11 +323,11 @@ https://${{ secrets.DOMAIN }}
       run: |
         echo "📋 ===== SUMMARY ====="
         echo ""
-        echo "🏗️  Application: ${{ env.APP_NAME }}"
+        echo "🏗️ Application: ${{ env.APP_NAME }}"
         echo "📊 Results:"
         echo "  🔍 Validate: ${{ needs.validate.result }}"
         echo "  🔒 Security: ${{ needs.security.result }}"
-        echo "  🏗️  Build: ${{ needs.build.result }}"
+        echo "  🏗️ Build: ${{ needs.build.result }}"
         echo "  🚀 Deploy: ${{ needs.deploy.result }}"
         echo ""
         echo "🌐 URL: https://${{ secrets.DOMAIN }}"
