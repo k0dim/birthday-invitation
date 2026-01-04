@@ -1,7 +1,7 @@
-import React from 'react';
-import { motion } from 'framer-motion';
-import { Sparkles, Calendar } from 'lucide-react';
-import AddToCalendar from './AddToCalendar';
+import React from 'react'
+import { motion } from 'framer-motion'
+import { Sparkles, Calendar } from 'lucide-react'
+import AddToCalendar from './AddToCalendar'
 
 export default function HeroSection() {
   return (
@@ -94,5 +94,5 @@ export default function HeroSection() {
         </motion.div>
       </motion.div>
     </section>
-  );
+  )
 }
