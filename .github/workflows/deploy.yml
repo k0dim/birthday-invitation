@@ -1,15 +1,50 @@
-name: 🚀 Production Deployment
+name: 🚀 Production Deployment Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      force:
+        description: 'Force deployment (skip tests)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # ==================== VALIDATION ====================
+  validate:
+    name: 🔍 Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+  # ==================== BUILD ====================
   build:
     name: 🏗️ Build
     runs-on: ubuntu-latest
+    needs: validate
     timeout-minutes: 15
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+      build_id: ${{ steps.generate_build_id.outputs.build_id }}
     
     steps:
     - name: Checkout code
@@ -21,44 +56,87 @@ jobs:
         node-version: '20'
         cache: 'npm'
     
+    - name: Extract version
+      id: extract_version
+      run: |
+        VERSION=$(node -p "require('./package.json').version || '1.0.0'")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "📦 Version: $VERSION"
+    
+    - name: Generate build ID
+      id: generate_build_id
+      run: |
+        BUILD_ID="${GITHUB_SHA:0:7}-$(date +%Y%m%d%H%M%S)"
+        echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+        echo "🏷️ Build ID: $BUILD_ID"
+    
     - name: Install dependencies
-      run: npm ci
+      run: |
+        echo "📦 Installing dependencies..."
+        npm ci
     
     - name: Build application
       env:
         VITE_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         VITE_TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        VITE_APP_VERSION: ${{ steps.extract_version.outputs.version }}
+        VITE_BUILD_ID: ${{ steps.generate_build_id.outputs.build_id }}
+        VITE_BUILD_DATE: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        VITE_COMMIT_SHA: ${{ github.sha }}
       run: |
         echo "🚀 Building application..."
         npm run build
-        
-        echo "📁 Build contents:"
-        ls -la dist/
         
         if [ ! -f "dist/index.html" ]; then
           echo "❌ dist/index.html not found!"
           exit 1
         fi
+        
+        echo "📁 Build contents:"
+        ls -la dist/
+    
+    - name: Create build manifest
+      run: |
+        echo "📄 Creating build manifest..."
+        cat > dist/build-manifest.json << EOF
+        {
+          "application": "birthday-invitation",
+          "version": "${{ steps.extract_version.outputs.version }}",
+          "buildId": "${{ steps.generate_build_id.outputs.build_id }}",
+          "commitSha": "${{ github.sha }}",
+          "branch": "${{ github.ref_name }}",
+          "builtAt": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        }
+        EOF
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: build-artifacts
+        name: build-${{ steps.generate_build_id.outputs.build_id }}
         path: dist/
         retention-days: 30
 
+  # ==================== DEPLOY ====================
   deploy:
-    name: 🚀 Deploy to Server
+    name: 🚀 Deploy to Production
     runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    needs: [build]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
     
     steps:
     - name: Download build artifacts
       uses: actions/download-artifact@v4
       with:
-        name: build-artifacts
+        name: build-${{ needs.build.outputs.build_id }}
+        path: .  # Скачиваем в текущую директорию
+    
+    - name: List downloaded files
+      run: |
+        echo "📁 Downloaded files:"
+        ls -la
+        echo "📁 dist directory:"
+        ls -la dist/ 2>/dev/null || echo "dist directory not found"
     
     - name: Setup SSH
       run: |
@@ -81,7 +159,7 @@ jobs:
     - name: Verify server connectivity
       run: |
         echo "🔍 Testing server connection..."
-        ssh deploy-server "echo '✅ Connected to server!'"
+        ssh deploy-server "echo '✅ Connected!' && hostname"
     
     - name: Create backup
       run: |
@@ -91,139 +169,225 @@ jobs:
         ssh deploy-server "
           sudo mkdir -p /var/backups/birthday-invitation
           if [ -d '/var/www/birthday-invitation/dist' ]; then
-            echo 'Creating backup...'
-            sudo tar -czf \"/var/backups/birthday-invitation/backup_$TIMESTAMP.tar.gz\" -C '/var/www/birthday-invitation' dist/
-            echo '✅ Backup created'
+            echo 'Creating backup of existing deployment...'
+            sudo tar -czf '/var/backups/birthday-invitation/backup_\$TIMESTAMP.tar.gz' -C '/var/www/birthday-invitation' dist/
+            echo '✅ Backup created: backup_\$TIMESTAMP.tar.gz'
+            echo 'Backup size:'
+            sudo du -h '/var/backups/birthday-invitation/backup_\$TIMESTAMP.tar.gz'
           else
-            echo '⚠️ No existing deployment'
+            echo '⚠️ No existing deployment found, skipping backup'
           fi
         "
     
-    - name: Prepare directory
+    - name: Prepare directory on server
       run: |
-        echo "📁 Preparing directory..."
+        echo "📁 Preparing directory on server..."
         ssh deploy-server "
+          # Создаем директорию приложения
           sudo mkdir -p '/var/www/birthday-invitation'
           sudo chown -R '${{ secrets.DEPLOY_USER }}:${{ secrets.DEPLOY_USER }}' '/var/www/birthday-invitation'
           
+          # Очищаем старые файлы если они есть
           if [ -d '/var/www/birthday-invitation/dist' ]; then
+            echo 'Cleaning old deployment...'
             rm -rf '/var/www/birthday-invitation/dist/*'
           else
             mkdir -p '/var/www/birthday-invitation/dist'
           fi
+          
+          echo 'Directory prepared:'
+          ls -la '/var/www/birthday-invitation/'
         "
     
-    - name: Deploy files
+    - name: Deploy files to server
       run: |
-        echo "📤 Deploying files..."
+        echo "📤 Deploying files to server..."
         
-        # Проверяем файлы
+        # Проверяем что файлы существуют
+        echo "Checking local files..."
         if [ ! -d "dist" ]; then
-          echo "❌ dist directory not found!"
+          echo "❌ dist directory not found locally!"
           ls -la
           exit 1
         fi
         
-        # Копируем файлы
-        scp -r dist/* deploy-server:'/var/www/birthday-invitation/dist/'
+        # Копируем файлы по одному или всю папку
+        echo "Copying dist directory..."
+        scp -r dist deploy-server:'/var/www/birthday-invitation/'
         
-        echo "✅ Files deployed"
+        echo "✅ Files copied to server"
         
+        # Проверяем что файлы скопировались
         ssh deploy-server "
-          echo 'Files on server:'
+          echo 'Checking deployed files on server...'
           ls -la '/var/www/birthday-invitation/dist/' | head -10
+          echo 'Total files count:'
+          find '/var/www/birthday-invitation/dist/' -type f | wc -l
         "
     
-    - name: Set permissions
+    - name: Set permissions on server
       run: |
-        echo "🔒 Setting permissions..."
+        echo "🔒 Setting permissions on server..."
         ssh deploy-server "
+          # Устанавливаем правильные права
           sudo chown -R www-data:www-data '/var/www/birthday-invitation/dist'
           sudo find '/var/www/birthday-invitation/dist' -type f -exec chmod 644 {} \;
           sudo find '/var/www/birthday-invitation/dist' -type d -exec chmod 755 {} \;
-          echo '✅ Permissions set'
+          
+          echo 'Permissions set:'
+          ls -la '/var/www/birthday-invitation/dist/' | head -5
         "
     
     - name: Configure Nginx
       run: |
         echo "⚙️ Configuring Nginx..."
         
-        # Создаем простой nginx конфиг
-        echo "server {
-          listen 80;
-          server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-          return 301 https://\$server_name\$request_uri;
+        # Создаем nginx конфиг
+        cat > nginx-birthday.conf << 'EOF'
+        server {
+            listen 80;
+            server_name DOMAIN www.DOMAIN;
+            return 301 https://$server_name$request_uri;
         }
         
         server {
-          listen 443 ssl http2;
-          listen [::]:443 ssl http2;
-          server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-          
-          ssl_certificate /etc/ssl/certs/birthday-invitation.crt;
-          ssl_certificate_key /etc/ssl/private/birthday-invitation.key;
-          
-          root /var/www/birthday-invitation/dist;
-          index index.html;
-          
-          location / {
-            try_files \$uri \$uri/ /index.html;
-          }
-          
-          location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg)\$ {
-            expires 1y;
-            add_header Cache-Control \"public, immutable\";
-          }
-        }" > nginx.conf
+            listen 443 ssl http2;
+            listen [::]:443 ssl http2;
+            server_name DOMAIN www.DOMAIN;
+            
+            ssl_certificate /etc/ssl/certs/birthday-invitation.crt;
+            ssl_certificate_key /etc/ssl/private/birthday-invitation.key;
+            
+            root /var/www/birthday-invitation/dist;
+            index index.html;
+            
+            location / {
+                try_files $uri $uri/ /index.html;
+            }
+            
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+            
+            # Health check endpoint
+            location /health {
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+        }
+        EOF
         
-        # Копируем на сервер
-        scp nginx.conf deploy-server:/tmp/nginx.conf
+        # Заменяем DOMAIN на реальный домен
+        sed -i "s/DOMAIN/${{ secrets.DOMAIN }}/g" nginx-birthday.conf
         
-        # Настраиваем
+        # Копируем конфиг на сервер
+        scp nginx-birthday.conf deploy-server:/tmp/nginx-birthday.conf
+        
+        # Настраиваем nginx на сервере
         ssh deploy-server "
+          echo 'Setting up Nginx configuration...'
+          
+          # Проверяем установлен ли nginx
           if ! command -v nginx &> /dev/null; then
             echo 'Installing nginx...'
             sudo apt update
             sudo apt install -y nginx
           fi
           
-          sudo cp /tmp/nginx.conf /etc/nginx/sites-available/birthday-invitation
-          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
+          # Копируем конфиг
+          sudo cp /tmp/nginx-birthday.conf /etc/nginx/sites-available/birthday-invitation
+          
+          # Создаем симлинк если его нет
+          if [ ! -L '/etc/nginx/sites-enabled/birthday-invitation' ]; then
+            sudo ln -s /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
+          fi
+          
+          # Удаляем дефолтный сайт если он есть
           sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
           
-          sudo nginx -t && sudo systemctl reload nginx
-          echo '✅ Nginx configured'
+          # Проверяем конфигурацию
+          echo 'Testing Nginx configuration...'
+          sudo nginx -t
+          
+          if [ $? -eq 0 ]; then
+            echo '✅ Nginx configuration test passed'
+            
+            # Перезагружаем nginx
+            echo 'Reloading Nginx...'
+            sudo systemctl reload nginx
+            
+            echo 'Nginx status:'
+            sudo systemctl status nginx --no-pager | head -5
+          else
+            echo '❌ Nginx configuration test failed'
+            exit 1
+          fi
         "
         
-        rm nginx.conf
+        # Удаляем временный файл
+        rm nginx-birthday.conf
     
     - name: Verify deployment
       run: |
         echo "🔍 Verifying deployment..."
-        sleep 3
+        
+        # Ждем чтобы nginx успел перезагрузиться
+        sleep 5
+        
+        echo "Running verification checks..."
         
         ssh deploy-server "
-          echo '=== Deployment Status ==='
-          echo '1. Nginx status:'
-          sudo systemctl status nginx --no-pager | head -3
+          echo '=== Server Status ==='
+          
+          # Проверяем nginx
+          echo '1. Nginx service status:'
+          sudo systemctl is-active nginx
+          
+          # Проверяем файлы
           echo ''
-          echo '2. Application files:'
-          ls -la '/var/www/birthday-invitation/dist/index.html'
+          echo '2. Deployed files:'
+          ls -la '/var/www/birthday-invitation/dist/' | grep -E 'index.html|total'
+          
+          # Проверяем доступность локально
           echo ''
-          echo '3. Health check:'
+          echo '3. Local accessibility:'
           if command -v curl > /dev/null; then
-            curl -s -o /dev/null -w 'HTTP Status: %{http_code}\\n' https://localhost/
+            echo 'HTTP status from localhost:'
+            curl -s -o /dev/null -w '%{http_code}' https://localhost/ && echo ' - OK'
           else
-            echo 'curl not installed'
+            echo 'curl not available, installing...'
+            sudo apt update && sudo apt install -y curl
+            curl -s -o /dev/null -w '%{http_code}' https://localhost/ && echo ' - OK'
+          fi
+          
+          # Проверяем SSL сертификат
+          echo ''
+          echo '4. SSL certificate check:'
+          if [ -f '/etc/ssl/certs/birthday-invitation.crt' ]; then
+            echo '✅ SSL certificate found'
+          else
+            echo '⚠️ SSL certificate not found at /etc/ssl/certs/birthday-invitation.crt'
           fi
         "
         
         echo ""
-        echo "🎉 DEPLOYMENT SUCCESSFUL!"
-        echo "🌐 Your application is live at:"
-        echo "   https://${{ secrets.DOMAIN }}"
-        echo "   http://${{ secrets.SERVER_IP }}"
+        echo "=========================================="
+        echo "🎉 DEPLOYMENT COMPLETED!"
+        echo ""
+        echo "🌐 Your application is available at:"
+        echo "   • https://${{ secrets.DOMAIN }}"
+        echo "   • http://${{ secrets.SERVER_IP }} (redirects to HTTPS)"
+        echo ""
+        echo "📊 Health check:"
+        echo "   • https://${{ secrets.DOMAIN }}/health"
+        echo ""
+        echo "🔧 Build information:"
+        echo "   • Version: ${{ needs.build.outputs.version }}"
+        echo "   • Build ID: ${{ needs.build.outputs.build_id }}"
+        echo "=========================================="
 
+  # ==================== NOTIFICATION ====================
   notify:
     name: 📨 Notify
     runs-on: ubuntu-latest
@@ -236,20 +400,63 @@ jobs:
         BUILD_STATUS: ${{ needs.build.result }}
         DEPLOY_STATUS: ${{ needs.deploy.result }}
       run: |
-        echo "📨 Sending notification..."
+        echo "📨 Sending Telegram notification..."
         
+        # Определяем статус
         if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
-          STATUS="✅ УСПЕШНО"
           EMOJI="🎉"
+          STATUS="✅ УСПЕШНО"
+        elif [ "$DEPLOY_STATUS" = "failure" ]; then
+          EMOJI="❌"
+          STATUS="⚠️ ОШИБКА ДЕПЛОЯ"
+        elif [ "$BUILD_STATUS" = "failure" ]; then
+          EMOJI="🚨"
+          STATUS="⚠️ ОШИБКА СБОРКИ"
         else
-          STATUS="❌ ОШИБКА"
-          EMOJI="⚠️"
+          EMOJI="⚪"
+          STATUS="❓ НЕИЗВЕСТНО"
         fi
         
-        MESSAGE="$EMOJI <b>Деплой приложения</b>\n\n$STATUS\n\n🌐 Приложение: https://${{ secrets.DOMAIN }}\n🕐 Время: $(date '+%d.%m.%Y %H:%M')"
+        # Формируем сообщение - одна строка
+        MESSAGE="${EMOJI} <b>Деплой birthday-invitation</b>\n\n${STATUS}\n\n📦 Версия: ${{ needs.build.outputs.version }}\n🏷️ Сборка: ${{ needs.build.outputs.build_id }}\n\n🌐 Приложение:\nhttps://${{ secrets.DOMAIN }}\n\n🕐 $(date '+%d.%m.%Y %H:%M:%S')"
         
+        # Отправляем в Telegram
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -H "Content-Type: application/json" \
-          -d "{\"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\": \"$MESSAGE\", \"parse_mode\": \"HTML\"}" || echo "⚠️ Failed to send notification"
+          -d "{\"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\": \"$MESSAGE\", \"parse_mode\": \"HTML\"}" || echo "⚠️ Failed to send Telegram notification"
         
         echo "✅ Notification sent"
+
+  # ==================== CLEANUP ====================
+  cleanup:
+    name: 🧹 Cleanup
+    runs-on: ubuntu-latest
+    needs: [notify]
+    if: always()
+    
+    steps:
+    - name: Deployment summary
+      run: |
+        echo "📋 ===== DEPLOYMENT SUMMARY ====="
+        echo ""
+        echo "🏗️ Application: birthday-invitation"
+        echo "🚀 Trigger: ${{ github.event_name }}"
+        echo "👤 Actor: ${{ github.actor }}"
+        echo "🌿 Branch: ${{ github.ref_name }}"
+        echo ""
+        echo "📊 Pipeline Results:"
+        echo "  ✅ Validate: ${{ needs.validate.result }}"
+        echo "  ✅ Build: ${{ needs.build.result }}"
+        echo "  ✅ Deploy: ${{ needs.deploy.result }}"
+        echo "  ✅ Notify: ${{ needs.notify.result }}"
+        echo ""
+        echo "🌐 Application URL: https://${{ secrets.DOMAIN }}"
+        echo "🏷️ Build ID: ${{ needs.build.outputs.build_id }}"
+        echo "📦 Version: ${{ needs.build.outputs.version }}"
+        echo ""
+        
+        if [ "${{ needs.deploy.result }}" = "success" ]; then
+          echo "🎉 Deployment successful! Your application is live!"
+        else
+          echo "❌ Deployment failed. Check logs above for details."
+        fi
