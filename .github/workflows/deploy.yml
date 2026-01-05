@@ -34,13 +34,13 @@ env:
   
   # Deployment paths
   DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-  DEPLOY_PATH: '/var/www/${{ env.APP_NAME }}'
-  BACKUP_PATH: '/var/backups/${{ env.APP_NAME }}'
+  DEPLOY_PATH: '/var/www/birthday-invitation'
+  BACKUP_PATH: '/var/backups/birthday-invitation'
   
   # Nginx
   NGINX_SITES_AVAILABLE: '/etc/nginx/sites-available'
   NGINX_SITES_ENABLED: '/etc/nginx/sites-enabled'
-  NGINX_SITE_NAME: '${{ env.APP_NAME }}'
+  NGINX_SITE_NAME: 'birthday-invitation'
 
 jobs:
   # ==================== VALIDATION ====================
@@ -281,7 +281,7 @@ jobs:
         
         cat > dist/build-manifest.json << EOF
         {
-          "application": "${{ env.APP_NAME }}",
+          "application": "birthday-invitation",
           "version": "${{ steps.extract_version.outputs.version }}",
           "buildId": "${{ steps.generate_build_id.outputs.build_id }}",
           "commitSha": "${{ github.sha }}",
@@ -398,7 +398,7 @@ jobs:
         echo "💾 Creating backup..."
         
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        BACKUP_NAME="${{ env.APP_NAME }}_backup_$TIMESTAMP.tar.gz"
+        BACKUP_NAME="birthday-invitation_backup_$TIMESTAMP.tar.gz"
         
         ssh deploy-server "
           echo 'Creating backup of current deployment...'
@@ -414,9 +414,9 @@ jobs:
             
             # Сохраняем последние 5 бэкапов
             echo 'Cleaning old backups (keeping last 5)...'
-            sudo ls -t ${{ env.BACKUP_PATH }}/${{ env.APP_NAME }}_backup_*.tar.gz 2>/dev/null | tail -n +6 | sudo xargs -r rm
+            sudo ls -t ${{ env.BACKUP_PATH }}/birthday-invitation_backup_*.tar.gz 2>/dev/null | tail -n +6 | sudo xargs -r rm
             echo 'Current backups:'
-            sudo ls -lh ${{ env.BACKUP_PATH }}/${{ env.APP_NAME }}_backup_*.tar.gz 2>/dev/null || echo 'No previous backups'
+            sudo ls -lh ${{ env.BACKUP_PATH }}/birthday-invitation_backup_*.tar.gz 2>/dev/null || echo 'No previous backups'
           else
             echo '⚠️  No existing deployment found, skipping backup'
           fi
@@ -503,8 +503,8 @@ jobs:
             server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
             
             # SSL Configuration
-            ssl_certificate /etc/ssl/certs/${{ env.APP_NAME }}.crt;
-            ssl_certificate_key /etc/ssl/private/${{ env.APP_NAME }}.key;
+            ssl_certificate /etc/ssl/certs/birthday-invitation.crt;
+            ssl_certificate_key /etc/ssl/private/birthday-invitation.key;
             ssl_protocols TLSv1.2 TLSv1.3;
             ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
             ssl_prefer_server_ciphers off;
@@ -691,7 +691,7 @@ jobs:
         # Deployment Report
         
         ## Summary
-        - **Application**: ${{ env.APP_NAME }}
+        - **Application**: birthday-invitation
         - **Environment**: Production
         - **Status**: ${{ needs.deploy.result }}
         - **Deployed At**: $DEPLOYMENT_TIME
@@ -762,7 +762,7 @@ jobs:
         
         # Формируем сообщение с правильным форматированием
         cat > message.txt << 'EOF'
-        $EMOJI <b>Деплой ${{ env.APP_NAME }}</b>
+        $EMOJI <b>Деплой birthday-invitation</b>
         
         $STATUS_ICON Статус: $STATUS_TEXT
         📦 Версия: <code>${{ needs.build.outputs.version }}</code>
@@ -856,7 +856,7 @@ jobs:
       run: |
         echo "📋 ===== DEPLOYMENT PIPELINE SUMMARY ====="
         echo ""
-        echo "🏗️  Application: ${{ env.APP_NAME }}"
+        echo "🏗️  Application: birthday-invitation"
         echo "🚀 Trigger: ${{ github.event_name }}"
         echo "👤 Actor: ${{ github.actor }}"
         echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
