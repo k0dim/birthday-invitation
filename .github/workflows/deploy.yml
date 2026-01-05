@@ -484,157 +484,164 @@ jobs:
       run: |
         echo "🔐 Setting up SSL with Let's Encrypt..."
         
-        # Сначала создаем HTTP конфиг для проверки домена
-        cat > nginx-http.conf << EOF
+        # Создаем простой HTTP конфиг для certbot
+        cat > nginx-http.conf << 'EOF'
         server {
             listen 80;
-            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            
-            # Root directory
-            root ${{ env.DEPLOY_PATH }}/dist;
+            server_name $DOMAIN www.$DOMAIN;
+            root $DEPLOY_PATH/dist;
             index index.html;
             
-            # Для проверки Let's Encrypt
             location /.well-known/acme-challenge/ {
                 root /var/www/html;
-                try_files \$uri =404;
             }
             
-            # SPA routing
             location / {
-                try_files \$uri \$uri/ /index.html;
+                try_files $uri $uri/ /index.html;
             }
         }
         EOF
         
-        # Копируем временный HTTP конфиг
+        # Заменяем переменные в конфиге
+        sed -i "s|\$DOMAIN|${{ secrets.DOMAIN }}|g" nginx-http.conf
+        sed -i "s|\$DEPLOY_PATH|${{ env.DEPLOY_PATH }}|g" nginx-http.conf
+        
+        # Копируем на сервер
         scp nginx-http.conf deploy-server:/tmp/nginx-http.conf
         
-        ssh deploy-server "
-          echo '📦 Preparing for Let\'s Encrypt...'
+        # Выполняем команды на сервере
+        ssh deploy-server << 'REMOTE_EOF'
+          echo "📦 Preparing for Let's Encrypt..."
           
-          # Отключаем текущий сайт если есть
-          sudo rm -f ${{ env.NGINX_SITES_ENABLED }}/${{ env.NGINX_SITE_NAME }} 2>/dev/null || true
+          # Отключаем текущий сайт
+          sudo rm -f /etc/nginx/sites-enabled/birthday-invitation 2>/dev/null || true
           
           # Устанавливаем временный HTTP конфиг
-          sudo cp /tmp/nginx-http.conf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}
-          sudo ln -sf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }} ${{ env.NGINX_SITES_ENABLED }}/
+          sudo cp /tmp/nginx-http.conf /etc/nginx/sites-available/birthday-invitation
+          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
           
           # Перезагружаем nginx
           sudo nginx -t && sudo systemctl reload nginx
-          echo '✅ Temporary HTTP config applied'
+          echo "✅ Temporary HTTP config applied"
           
           # Устанавливаем certbot если нет
           if ! command -v certbot &> /dev/null; then
-            echo 'Installing certbot...'
+            echo "Installing certbot..."
             sudo apt-get update
             sudo apt-get install -y certbot python3-certbot-nginx
           fi
           
           # Получаем сертификат
-          echo '📝 Obtaining SSL certificate from Let\'s Encrypt...'
-          if sudo certbot --nginx \
+          echo "📝 Obtaining SSL certificate..."
+          sudo certbot --nginx --non-interactive --agree-tos \
+            --email admin@${{ secrets.DOMAIN }} \
             -d ${{ secrets.DOMAIN }} \
             -d www.${{ secrets.DOMAIN }} \
-            --non-interactive \
-            --agree-tos \
-            --email admin@${{ secrets.DOMAIN }} \
-            --redirect \
-            --hsts \
-            --uir; then
-            
-            echo '✅ SSL certificate obtained successfully'
-            
-            # Проверяем срок действия
-            echo '📅 Certificate info:'
-            sudo certbot certificates
-            
-            # Настраиваем авто-обновление
-            echo '🔄 Setting up auto-renewal...'
-            sudo systemctl enable certbot.timer
-            sudo systemctl start certbot.timer
-            echo 'Auto-renewal status:'
-            sudo systemctl status certbot.timer --no-pager | head -5
-            
-          else
-            echo '❌ Failed to obtain SSL certificate'
-            echo '⚠️  Falling back to HTTP-only configuration'
-            
-            # Создаем постоянный HTTP конфиг
-            cat > /tmp/nginx-permanent-http.conf << 'CONFIG'
-            server {
-                listen 80;
-                server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-                
-                # Security Headers
-                add_header X-Frame-Options "SAMEORIGIN" always;
-                add_header X-Content-Type-Options "nosniff" always;
-                add_header X-XSS-Protection "1; mode=block" always;
-                add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-                
-                # Root directory
-                root ${{ env.DEPLOY_PATH }}/dist;
-                index index.html;
-                
-                # Logging
-                access_log ${{ env.DEPLOY_PATH }}/logs/nginx-access.log;
-                error_log ${{ env.DEPLOY_PATH }}/logs/nginx-error.log;
-                
-                # Gzip Compression
-                gzip on;
-                gzip_vary on;
-                gzip_min_length 1024;
-                gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
-                
-                # SPA routing
-                location / {
-                    try_files \$uri \$uri/ /index.html;
-                    expires -1;
-                }
-                
-                # Cache static assets
-                location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
-                    expires 1y;
-                    add_header Cache-Control "public, immutable";
-                    access_log off;
-                }
-                
-                # Health check endpoint
-                location /health {
-                    access_log off;
-                    return 200 "healthy\n";
-                    add_header Content-Type text/plain;
-                }
-                
-                # Version endpoint
-                location /version {
-                    alias ${{ env.DEPLOY_PATH }}/dist/.version;
-                    access_log off;
-                    add_header Content-Type text/plain;
-                }
-                
-                # Block access to sensitive files
-                location ~ /\. {
-                    deny all;
-                    access_log off;
-                    log_not_found off;
-                }
-                
-                location ~* \.(log|sql|db|bak|old|orig)$ {
-                    deny all;
-                    access_log off;
-                    log_not_found off;
-                }
-            }
-            CONFIG
-            
-            sudo cp /tmp/nginx-permanent-http.conf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}
-            sudo nginx -t && sudo systemctl reload nginx
-            echo '✅ Fallback HTTP config applied'
-          fi
-        "
+            --redirect || echo "⚠️ Certbot failed, will use HTTP"
+          
+          echo "✅ Let's Encrypt setup attempted"
+        REMOTE_EOF
         
         rm -f nginx-http.conf
+
+    - name: Configure final Nginx
+      run: |
+        echo "⚙️  Configuring final Nginx..."
+        
+        # Проверяем, есть ли SSL сертификат
+        SSL_STATUS=$(ssh deploy-server "if [ -f /etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem ]; then echo 'ssl'; else echo 'http'; fi")
+        
+        if [ "$SSL_STATUS" = "ssl" ]; then
+          echo "✅ SSL certificate found, configuring HTTPS..."
+          
+          cat > nginx-ssl.conf << 'EOF'
+          server {
+              listen 80;
+              server_name $DOMAIN www.$DOMAIN;
+              return 301 https://$server_name$request_uri;
+          }
+          
+          server {
+              listen 443 ssl http2;
+              server_name $DOMAIN www.$DOMAIN;
+              
+              ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+              
+              root $DEPLOY_PATH/dist;
+              index index.html;
+              
+              # Security headers
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              
+              # SPA routing
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              # Static assets
+              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+                  access_log off;
+              }
+              
+              location /health { return 200 "healthy\n"; }
+              location /version { alias $DEPLOY_PATH/dist/.version; }
+          }
+          EOF
+          
+          CONFIG_FILE="nginx-ssl.conf"
+        else
+          echo "⚠️  No SSL certificate, using HTTP only"
+          
+          cat > nginx-http-only.conf << 'EOF'
+          server {
+              listen 80;
+              server_name $DOMAIN www.$DOMAIN;
+              
+              root $DEPLOY_PATH/dist;
+              index index.html;
+              
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+                  access_log off;
+              }
+              
+              location /health { return 200 "healthy\n"; }
+              location /version { alias $DEPLOY_PATH/dist/.version; }
+          }
+          EOF
+          
+          CONFIG_FILE="nginx-http-only.conf"
+        fi
+        
+        # Заменяем переменные
+        sed -i "s|\$DOMAIN|${{ secrets.DOMAIN }}|g" "$CONFIG_FILE"
+        sed -i "s|\$DEPLOY_PATH|${{ env.DEPLOY_PATH }}|g" "$CONFIG_FILE"
+        
+        # Копируем на сервер
+        scp "$CONFIG_FILE" deploy-server:/tmp/nginx-final.conf
+        
+        # Применяем конфиг
+        ssh deploy-server '
+          sudo cp /tmp/nginx-final.conf /etc/nginx/sites-available/birthday-invitation
+          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+          sudo nginx -t && sudo systemctl reload nginx
+          echo "✅ Nginx configured successfully"
+        '
+        
+        rm -f "$CONFIG_FILE"
 
     - name: Configure Nginx (if Let's Encrypt failed)
       if: failure()
