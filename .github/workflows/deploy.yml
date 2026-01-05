@@ -666,7 +666,7 @@ jobs:
   post_deploy:
     name: 📊 Post-Deployment
     runs-on: ubuntu-latest
-    needs: [deploy]
+    needs: [validate, security, build, deploy]
     if: always()
     timeout-minutes: 10
     
@@ -677,6 +677,19 @@ jobs:
         fetch-depth: 0
     
     - name: Generate deployment report
+      env:
+        DEPLOY_RESULT: ${{ needs.deploy.result }}
+        BUILD_ID: ${{ needs.build.outputs.build_id }}
+        BUILD_VERSION: ${{ needs.build.outputs.version }}
+        SERVER_IP: ${{ secrets.SERVER_IP }}
+        DOMAIN: ${{ secrets.DOMAIN }}
+        DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        VALIDATE_RESULT: ${{ needs.validate.result }}
+        SECURITY_RESULT: ${{ needs.security.result }}
+        BUILD_RESULT: ${{ needs.build.result }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         echo "📊 Generating deployment report..."
         
@@ -693,33 +706,33 @@ jobs:
         ## Summary
         - **Application**: birthday-invitation
         - **Environment**: Production
-        - **Status**: ${{ needs.deploy.result }}
+        - **Status**: $DEPLOY_RESULT
         - **Deployed At**: $DEPLOYMENT_TIME
         
         ## Build Information
-        - **Build ID**: ${{ needs.build.outputs.build_id }}
-        - **Version**: ${{ needs.build.outputs.version }}
+        - **Build ID**: $BUILD_ID
+        - **Version**: $BUILD_VERSION
         - **Commit**: $GIT_COMMIT
         - **Author**: $GIT_AUTHOR
         - **Message**: $GIT_MESSAGE
         - **Branch**: $BRANCH
         
         ## Deployment Details
-        - **Server**: ${{ secrets.SERVER_IP }}
-        - **Domain**: ${{ secrets.DOMAIN }}
-        - **Deploy Path**: ${{ env.DEPLOY_PATH }}
+        - **Server**: $SERVER_IP
+        - **Domain**: $DOMAIN
+        - **Deploy Path**: $DEPLOY_PATH
         - **Backup Created**: Yes
         
         ## Quality Gates
-        - **Validation**: ${{ needs.validate.result }}
-        - **Security Scan**: ${{ needs.security.result }}
-        - **Build**: ${{ needs.build.result }}
-        - **Deploy**: ${{ needs.deploy.result }}
+        - **Validation**: $VALIDATE_RESULT
+        - **Security Scan**: $SECURITY_RESULT
+        - **Build**: $BUILD_RESULT
+        - **Deploy**: $DEPLOY_RESULT
         
         ## Links
-        - **Application**: https://${{ secrets.DOMAIN }}
-        - **Repository**: ${{ github.server_url }}/${{ github.repository }}
-        - **Workflow Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        - **Application**: https://$DOMAIN
+        - **Repository**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+        - **Workflow Run**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
         
         ## Next Steps
         1. Monitor application logs
@@ -734,12 +747,28 @@ jobs:
       env:
         BUILD_STATUS: ${{ needs.build.result }}
         DEPLOY_STATUS: ${{ needs.deploy.result }}
-        COMMIT_SHA: ${GITHUB_SHA:0:7}
-        COMMIT_MESSAGE: $(git log -1 --pretty=%B | head -n1)
-        COMMIT_AUTHOR: $(git log -1 --pretty=%an)
-        BRANCH: ${GITHUB_REF#refs/heads/}
+        APP_NAME: ${{ env.APP_NAME }}
+        BUILD_VERSION: ${{ needs.build.outputs.version }}
+        BUILD_ID: ${{ needs.build.outputs.build_id }}
+        SERVER_IP: ${{ secrets.SERVER_IP }}
+        DOMAIN: ${{ secrets.DOMAIN }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        VALIDATE_RESULT: ${{ needs.validate.result }}
+        SECURITY_RESULT: ${{ needs.security.result }}
+        BUILD_RESULT: ${{ needs.build.result }}
+        DEPLOY_RESULT: ${{ needs.deploy.result }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         echo "📨 Sending deployment notification..."
+        
+        # Получаем информацию о коммите
+        COMMIT_SHA="${GITHUB_SHA:0:7}"
+        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
+        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+        BRANCH="${GITHUB_REF#refs/heads/}"
         
         # Определяем статус и иконки
         if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
@@ -761,12 +790,13 @@ jobs:
         fi
         
         # Формируем сообщение с правильным форматированием
-        cat > message.txt << 'EOF'
-        $EMOJI <b>Деплой birthday-invitation</b>
+        # Используем двойные кавычки для подстановки переменных
+        cat > message.txt << EOF
+        $EMOJI <b>Деплой $APP_NAME</b>
         
         $STATUS_ICON Статус: $STATUS_TEXT
-        📦 Версия: <code>${{ needs.build.outputs.version }}</code>
-        🏷️ Сборка: <code>${{ needs.build.outputs.build_id }}</code>
+        📦 Версия: <code>$BUILD_VERSION</code>
+        🏷️ Сборка: <code>$BUILD_ID</code>
         
         📝 <b>Информация о коммите:</b>
         └─ Ветка: <code>$BRANCH</code>
@@ -775,40 +805,40 @@ jobs:
         └─ Сообщение: $COMMIT_MESSAGE
         
         🌐 <b>Доступ к приложению:</b>
-        • https://${{ secrets.DOMAIN }}
-        • http://${{ secrets.SERVER_IP }}
+        • https://$DOMAIN
+        • http://$SERVER_IP
         
         🔧 <b>Проверка здоровья:</b>
-        • https://${{ secrets.DOMAIN }}/health
-        • https://${{ secrets.DOMAIN }}/version
+        • https://$DOMAIN/health
+        • https://$DOMAIN/version
         
         📊 <b>Статусы:</b>
-        • Валидация: ${{ needs.validate.result }}
-        • Безопасность: ${{ needs.security.result }}
-        • Сборка: ${{ needs.build.result }}
-        • Деплой: ${{ needs.deploy.result }}
+        • Валидация: $VALIDATE_RESULT
+        • Безопасность: $SECURITY_RESULT
+        • Сборка: $BUILD_RESULT
+        • Деплой: $DEPLOY_RESULT
         
         🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>
         EOF
         
-        # Подставляем переменные
-        MESSAGE=$(envsubst < message.txt)
+        # Читаем сообщение
+        MESSAGE=$(cat message.txt)
         
         # Отправляем в Telegram
         echo "Sending to Telegram..."
         
-        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
           -H "Content-Type: application/json" \
           -d "{
-            \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+            \"chat_id\": \"$TELEGRAM_CHAT_ID\",
             \"text\": \"$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g')\",
             \"parse_mode\": \"HTML\",
             \"disable_web_page_preview\": true,
             \"reply_markup\": {
               \"inline_keyboard\": [
                 [
-                  {\"text\": \"🌐 Открыть приложение\", \"url\": \"https://${{ secrets.DOMAIN }}\"},
-                  {\"text\": \"📊 Посмотреть логи\", \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}
+                  {\"text\": \"🌐 Открыть приложение\", \"url\": \"https://$DOMAIN\"},
+                  {\"text\": \"📊 Посмотреть логи\", \"url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}
                 ]
               ]
             }
@@ -820,7 +850,7 @@ jobs:
   cleanup:
     name: 🧹 Cleanup
     runs-on: ubuntu-latest
-    needs: [post_deploy]
+    needs: [post_deploy, build, validate, security, deploy, ]
     if: always()
     
     steps:
