@@ -75,7 +75,13 @@ jobs:
     - name: Extract version and metadata
       id: extract_metadata
       run: |
-        VERSION=$(node -p "require('./package.json').version 2>/dev/null || '1.0.0'")
+        # Extract version from package.json
+        if [ -f "package.json" ]; then
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { '1.0.0' }")
+        else
+          VERSION="1.0.0"
+        fi
+        
         COMMIT_SHORT="${GITHUB_SHA:0:7}"
         BUILD_ID="${COMMIT_SHORT}-$(date +%Y%m%d%H%M%S)"
         
@@ -139,13 +145,26 @@ jobs:
     - name: Extract metadata
       id: extract_metadata
       run: |
-        VERSION=$(node -p "require('./package.json').version 2>/dev/null || '1.0.0'")
+        # Extract version from package.json using different approach
+        if [ -f "package.json" ]; then
+          VERSION=$(cat package.json | grep '"version"' | head -1 | awk -F: '{ print $2 }' | sed 's/[", ]//g')
+          if [ -z "$VERSION" ]; then
+            VERSION="1.0.0"
+          fi
+        else
+          VERSION="1.0.0"
+        fi
+        
         COMMIT_SHORT="${GITHUB_SHA:0:7}"
         BUILD_ID="${COMMIT_SHORT}-$(date +%Y%m%d%H%M%S)"
         
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
         echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+        
+        echo "📦 Version: $VERSION"
+        echo "🏷️ Build ID: $BUILD_ID"
+        echo "🔖 Commit: $COMMIT_SHORT"
     
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
