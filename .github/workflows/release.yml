@@ -1,0 +1,173 @@
+name: Release birthday-invitation
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: npm ci
+      - name: Validation
+        run: npm run lint || true
+
+  security:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: npm audit
+        run: npm audit --audit-level=high || true
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [validation, security]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+          | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ghcr.io/${{ github.repository }}/app:${{ github.sha }} .
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+      - name: Push image
+        run: |
+          docker push ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build]
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - name: Deploy (blue/green)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+            docker login ghcr.io \
+              -u ${{ secrets.GHCR_USERNAME }} \
+              -p ${{ secrets.GHCR_TOKEN }}
+
+            docker pull $IMAGE
+
+            CURRENT=$(docker ps --format "{{.Names}}" | grep app_ || true)
+
+            if [ "$CURRENT" = "app_blue" ]; then
+              NEW=app_green
+              OLD=app_blue
+            else
+              NEW=app_blue
+              OLD=app_green
+            fi
+
+            docker run -d \
+              --name $NEW \
+              --network backend \
+              -e GIT_COMMIT=${{ github.sha }} \
+              $IMAGE
+
+            for i in {1..10}; do
+              docker exec $NEW wget -qO- http://localhost:3000/health && break
+              sleep 3
+            done
+
+            sed -i "s/$OLD/$NEW/g" /opt/birthday/nginx/upstream.conf
+            docker exec birthday_nginx nginx -s reload
+            docker rm -f $OLD || true
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [validation, security, build, deploy]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          VERSION=$(jq -r .version package.json)
+          SHORT_SHA=${GITHUB_SHA::7}
+          BUILD_ID="${SHORT_SHA}-$(date +%Y%m%d%H%M%S)"
+          DATE=$(date '+%d.%m.%Y %H:%M:%S')
+          COMMIT_AUTHOR="${{ github.event.head_commit.author.name }}"
+          COMMIT_MESSAGE="${{ github.event.head_commit.message }}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          SERVER_IP="${{ secrets.SERVER_IP }}"
+          DOMAIN="${{ secrets.DOMAIN }}"
+
+          VALIDATION="${{ needs.validation.result }}"
+          SECURITY="${{ needs.security.result }}"
+          BUILD="${{ needs.build.result }}"
+          DEPLOY="${{ needs.deploy.result }}"
+
+          if [ "$DEPLOY" = "success" ]; then
+            STATUS="🟢 Статус: УСПЕШНО ✅"
+          else
+            STATUS="🔴 Статус: ОШИБКА ❌"
+          fi
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+          echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "COMMIT_AUTHOR=$COMMIT_AUTHOR" >> $GITHUB_ENV
+          echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          echo "VALIDATION=$VALIDATION" >> $GITHUB_ENV
+          echo "SECURITY=$SECURITY" >> $GITHUB_ENV
+          echo "BUILD=$BUILD" >> $GITHUB_ENV
+          echo "DEPLOY=$DEPLOY" >> $GITHUB_ENV
+          echo "STATUS=$STATUS" >> $GITHUB_ENV
+
+      - name: Send Telegram notification
+        run: |
+          # Составляем многострочное сообщение через переменную MESSAGE
+          MESSAGE="🎉 <b>Деплой birthday-invitation</b>\n$STATUS\n📦 Версия: <code>$VERSION</code>\n🏷️ Сборка: <code>$BUILD_ID</code>\n\n📝 <b>Информация о коммите:</b>\n└─ Ветка: <code>$BRANCH</code>\n└─ Коммит: <code>$SHORT_SHA</code>\n└─ Автор: $COMMIT_AUTHOR\n└─ Сообщение: $COMMIT_MESSAGE\n\n🌐 <b>Доступ к приложению:</b>\n• https://$DOMAIN\n• http://$SERVER_IP\n\n🔧 <b>Проверка здоровья:</b>\n• https://$DOMAIN/health\n• https://$DOMAIN/version\n\n📊 <b>Статусы:</b>\n• Валидация: $VALIDATION\n• Безопасность: $SECURITY\n• Сборка: $BUILD\n• Деплой: $DEPLOY\n\n🕐 <i>$DATE</i>"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+                  --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+                  --arg text "$MESSAGE" \
+                  --arg parse_mode "HTML" \
+                  '{
+                    chat_id: $chat_id,
+                    text: $text,
+                    parse_mode: $parse_mode,
+                    disable_web_page_preview: true
+                  }')"
+
+          echo "✅ Notification sent to Telegram"
