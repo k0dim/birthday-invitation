@@ -1,9 +1,13 @@
+# docker-compose.yml для сервера
 version: '3.8'
 
 services:
   web:
-    image: ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${APP_VERSION:-latest}
-    container_name: ${APP_NAME}
+    build:
+      context: ./src
+      dockerfile: infra/docker/Dockerfile.app
+    image: birthday-invitation:latest
+    container_name: birthday-invitation
     restart: unless-stopped
     ports:
       - "80:80"
@@ -19,7 +23,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
 
 volumes:
   ssl-certs:

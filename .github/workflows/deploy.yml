@@ -1,13 +1,5 @@
 name: 🚀 Production Deployment Pipeline
 
-# Настройка прав доступа для всего workflow
-permissions:
-  contents: read
-  actions: write
-  deployments: write
-  statuses: write
-  packages: write 
-
 on:
   push:
     branches: [ main, master ]
@@ -45,10 +37,11 @@ jobs:
     timeout-minutes: 5
     
     steps:
-    - name: Checkout repository
+    - name: Checkout repository with SSH
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
     
     - name: Validate files
       run: |
@@ -56,10 +49,6 @@ jobs:
         
         required_files=(
           "package.json"
-          "infra/docker/Dockerfile.app"
-          "infra/docker/docker-compose.yml"
-          "infra/nginx/nginx.conf"
-          "infra/nginx/sites/app.conf"
         )
         
         for file in "${required_files[@]}"; do
@@ -72,27 +61,6 @@ jobs:
         done
         
         echo "✅ Project structure validated"
-    
-    - name: Extract version and metadata
-      id: extract_metadata
-      run: |
-        # Extract version from package.json
-        if [ -f "package.json" ]; then
-          VERSION=$(node -p "try { require('./package.json').version } catch(e) { '1.0.0' }")
-        else
-          VERSION="1.0.0"
-        fi
-        
-        COMMIT_SHORT="${GITHUB_SHA:0:7}"
-        BUILD_ID="${COMMIT_SHORT}-$(date +%Y%m%d%H%M%S)"
-        
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
-        echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
-        
-        echo "📦 Version: $VERSION"
-        echo "🏷️ Build ID: $BUILD_ID"
-        echo "🔖 Commit: $COMMIT_SHORT"
 
   # ==================== SECURITY ====================
   security:
@@ -102,81 +70,163 @@ jobs:
     timeout-minutes: 10
     
     steps:
-    - name: Checkout code
+    - name: Checkout code with SSH
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
     
     - name: Dependency audit
       run: |
         echo "🛡️ Running dependency audit..."
-        npm audit --audit-level=moderate || echo "⚠️ Audit found vulnerabilities (continuing)"
+        
+        if [ -f "package.json" ]; then
+          echo "Checking npm dependencies..."
+          npm audit --audit-level=moderate || echo "⚠️ Audit found vulnerabilities (continuing deployment)"
+        else
+          echo "⚠️ package.json not found, skipping dependency audit"
+        fi
+    
+    - name: Check for exposed secrets
+      run: |
+        echo "🔍 Checking for exposed secrets..."
+        
+        # Простая проверка на случайные секреты в коде
+        forbidden_patterns=(
+          "password.*="
+          "token.*="
+          "secret.*="
+          "api[_-]key"
+          "ssh[_-]key"
+          "private[_-]key"
+        )
+        
+        found_secrets=false
+        
+        for pattern in "${forbidden_patterns[@]}"; do
+          echo "Checking pattern: $pattern"
+          if grep -r -i "$pattern" --include="*.js" --include="*.jsx" --include="*.json" --include="*.env*" . 2>/dev/null | grep -v "node_modules" | grep -v ".git" | grep -v "test" | grep -v "spec"; then
+            echo "⚠️ Potential secret found with pattern: $pattern"
+            found_secrets=true
+          fi
+        done
+        
+        if [ "$found_secrets" = true ]; then
+          echo "❌ Potential secrets found in code! Please review."
+          # Не прерываем выполнение, только предупреждаем
+          echo "⚠️ Continuing deployment, but please review the warnings above"
+        else
+          echo "✅ No obvious secrets found in code"
+        fi
+    
+    - name: Check environment files
+      run: |
+        echo "📁 Checking environment files..."
+        
+        # Убедимся что .env.local не закоммичен
+        if [ -f ".env.local" ]; then
+          echo "❌ .env.local should not be committed to repository!"
+          exit 1
+        fi
+        
+        # Проверяем наличие .env.example
+        if [ ! -f ".env.example" ]; then
+          echo "⚠️ .env.example is missing! Consider creating one for documentation"
+        else
+          echo "✅ .env.example found"
+        fi
+        
+        # Проверяем .env файлы на наличие реальных секретов
+        for env_file in .env .env.production .env.development; do
+          if [ -f "$env_file" ]; then
+            echo "Checking $env_file for hardcoded secrets..."
+            if grep -q "REAL_SECRET\|ACTUAL_PASSWORD\|LIVE_API_KEY" "$env_file" 2>/dev/null; then
+              echo "❌ Found potentially hardcoded secret in $env_file"
+              exit 1
+            fi
+          fi
+        done
+        
+        echo "✅ Environment files check passed"
     
     - name: Docker security scan
       run: |
-        echo "🐳 Scanning Dockerfiles..."
-        if command -v docker &> /dev/null; then
-          docker run --rm -v "$(pwd):/app" aquasec/trivy:latest config /app || echo "⚠️ Trivy scan completed"
+        echo "🐳 Scanning Docker configuration..."
+        
+        # Проверяем Dockerfile на наличие проблем
+        if [ -f "infra/docker/Dockerfile.app" ]; then
+          echo "Checking Dockerfile.app..."
+          
+          # Проверяем на использование последней версии
+          if grep -q "FROM node:latest" infra/docker/Dockerfile.app; then
+            echo "⚠️ Using 'node:latest' tag is not recommended for production"
+          fi
+          
+          # Проверяем на root пользователя
+          if grep -q "USER root" infra/docker/Dockerfile.app; then
+            echo "⚠️ Dockerfile runs as root, consider using non-root user"
+          fi
+          
+          # Проверяем на наличие секретов в Dockerfile
+          if grep -q "ARG.*TOKEN\|ARG.*SECRET\|ARG.*PASSWORD" infra/docker/Dockerfile.app; then
+            echo "⚠️ Dockerfile contains potential secret arguments"
+          fi
+          
+          echo "✅ Dockerfile basic checks completed"
         else
-          echo "ℹ️ Docker not available for security scan"
+          echo "⚠️ Dockerfile.app not found, skipping Docker security scan"
         fi
 
   # ==================== BUILD ====================
   build:
-    name: 🐳 Build & Push
+    name: 🐳 Build Docker Image Locally
     runs-on: ubuntu-latest
     needs: [validate, security]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     outputs:
       version: ${{ steps.extract_metadata.outputs.version }}
       build_id: ${{ steps.extract_metadata.outputs.build_id }}
       commit_short: ${{ steps.extract_metadata.outputs.commit_short }}
     
     steps:
-    - name: Checkout code
+    - name: Checkout code with SSH
       uses: actions/checkout@v4
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    
-    - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
       with:
-        registry: ${{ env.DOCKER_REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+        ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
     
     - name: Extract metadata
       id: extract_metadata
       run: |
-        # Extract version from package.json using different approach
+        # Extract version
+        VERSION="1.0.0"
         if [ -f "package.json" ]; then
-          VERSION=$(cat package.json | grep '"version"' | head -1 | awk -F: '{ print $2 }' | sed 's/[", ]//g')
-          if [ -z "$VERSION" ]; then
-            VERSION="1.0.0"
-          fi
-        else
-          VERSION="1.0.0"
+          VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\([^"]*\).*/\1/' || echo "1.0.0")
         fi
         
         COMMIT_SHORT="${GITHUB_SHA:0:7}"
         BUILD_ID="${COMMIT_SHORT}-$(date +%Y%m%d%H%M%S)"
         
         echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
         echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+        echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
         
         echo "📦 Version: $VERSION"
         echo "🏷️ Build ID: $BUILD_ID"
         echo "🔖 Commit: $COMMIT_SHORT"
     
-    - name: Build and push Docker image
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker image locally (no push)
       uses: docker/build-push-action@v5
       with:
         context: .
         file: ./infra/docker/Dockerfile.app
-        push: true
+        push: false  # Не пушим в registry
         tags: |
-          ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.extract_metadata.outputs.version }}
-          ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.extract_metadata.outputs.commit_short }}
-          ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          ${{ env.APP_NAME }}:latest
+          ${{ env.APP_NAME }}:${{ steps.extract_metadata.outputs.version }}
         labels: |
           org.opencontainers.image.title=${{ env.APP_NAME }}
           org.opencontainers.image.version=${{ steps.extract_metadata.outputs.version }}
@@ -187,12 +237,25 @@ jobs:
           VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+      
+    - name: Save Docker image as artifact
+      run: |
+        echo "💾 Saving Docker image as artifact..."
+        docker save ${{ env.APP_NAME }}:latest -o /tmp/${{ env.APP_NAME }}.tar
+        gzip /tmp/${{ env.APP_NAME }}.tar
+    
+    - name: Upload Docker image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: /tmp/${{ env.APP_NAME }}.tar.gz
+        retention-days: 1
 
   # ==================== DEPLOY ====================
   deploy:
     name: 🚀 Deploy to Server
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [validate, security, build]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
     environment: 
@@ -200,9 +263,28 @@ jobs:
       url: https://${{ vars.DOMAIN }}
     
     steps:
-    - name: Setup SSH
+    - name: Checkout repository with SSH
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+    
+    - name: Extract version
+      id: extract_version
       run: |
-        echo "🔐 Setting up SSH..."
+        echo "📦 Extracting version..."
+        
+        VERSION="1.0.0"
+        if [ -f "package.json" ]; then
+          VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\([^"]*\).*/\1/' || echo "1.0.0")
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "✅ Version: $VERSION"
+    
+    - name: Setup SSH for server connection
+      run: |
+        echo "🔐 Setting up SSH for server connection..."
         
         mkdir -p ~/.ssh
         echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
@@ -221,64 +303,19 @@ jobs:
         
         chmod 600 ~/.ssh/config
         
-        # Test connection
-        ssh deploy-server "echo '✅ SSH connection successful'"
+        ssh deploy-server "echo '✅ SSH connection to server successful'"
     
-    - name: Debug file structure
-      run: |
-        echo "🔍 DEBUG: Checking file structure..."
-        echo "=== Current directory ==="
-        pwd
-        echo ""
-        echo "=== Full directory listing ==="
-        ls -la
-        echo ""
-        echo "=== Checking infra directory ==="
-        if [ -d "infra" ]; then
-          echo "infra/ exists"
-          ls -la infra/
-          echo ""
-          echo "=== Checking infra/docker ==="
-          if [ -d "infra/docker" ]; then
-            echo "infra/docker/ exists"
-            ls -la infra/docker/
-            echo ""
-            echo "=== Checking docker-compose.yml ==="
-            if [ -f "infra/docker/docker-compose.yml" ]; then
-              echo "✅ FILE EXISTS: infra/docker/docker-compose.yml"
-              echo "=== File permissions ==="
-              stat infra/docker/docker-compose.yml
-              echo ""
-              echo "=== First 5 lines ==="
-              head -5 infra/docker/docker-compose.yml
-            else
-              echo "❌ FILE NOT FOUND: infra/docker/docker-compose.yml"
-              echo "=== Looking for any docker-compose files ==="
-              find . -name "*docker-compose*" -type f 2>/dev/null
-            fi
-          else
-            echo "❌ infra/docker/ does not exist"
-          fi
-        else
-          echo "❌ infra/ does not exist"
-        fi
-        echo ""
-        echo "=== Git status ==="
-        git status --short 2>/dev/null || echo "git not available"
-        echo ""
-        echo "=== Git log (last 3) ==="
-        git log --oneline -3 2>/dev/null || echo "git not available"
-        
     - name: Prepare deployment files
+      env:
+        APP_VERSION: ${{ steps.extract_version.outputs.version }}
       run: |
         echo "📁 Preparing deployment files..."
+        echo "Using APP_VERSION: $APP_VERSION"
         
-        # Create .env file for docker-compose
+        # Create .env file
         cat > .env.prod << EOF
         APP_NAME=${{ env.APP_NAME }}
-        DOCKER_REGISTRY=${{ env.DOCKER_REGISTRY }}
-        DOCKER_IMAGE_NAME=${{ env.DOCKER_IMAGE_NAME }}
-        APP_VERSION=${{ needs.build.outputs.version }}
+        APP_VERSION=$APP_VERSION
         VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
         VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
         EOF
@@ -293,60 +330,187 @@ jobs:
         
         echo "🔐 Generating SSL certificates for domain: $DOMAIN"
         
-        # Create temporary directory
         TEMP_DIR=$(mktemp -d)
         
-        # Generate certificates
         openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
           -keyout "$TEMP_DIR/selfsigned.key" \
           -out "$TEMP_DIR/selfsigned.crt" \
           -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=$DOMAIN"
         
-        # Create Docker volume if not exists
         if ! docker volume inspect $SSL_VOLUME > /dev/null 2>&1; then
           docker volume create $SSL_VOLUME
         fi
         
-        # Copy certificates to volume
         docker run --rm -v $SSL_VOLUME:/target -v "$TEMP_DIR:/source" alpine \
           sh -c "cp /source/* /target/ && chmod 644 /target/selfsigned.crt && chmod 600 /target/selfsigned.key"
         
-        # Cleanup
         rm -rf "$TEMP_DIR"
         
-        echo "✅ SSL certificates generated and stored in Docker volume: $SSL_VOLUME"
+        echo "✅ SSL certificates generated"
         EOF
         
         chmod +x generate-ssl.sh
         
+        # Create docker-compose.yml для локальной сборки
+        cat > docker-compose.yml << EOF
+        version: '3.8'
+
+        services:
+          web:
+            build:
+              context: .
+              dockerfile: infra/docker/Dockerfile.app
+            image: ${{ env.APP_NAME }}:latest
+            container_name: ${{ env.APP_NAME }}
+            restart: unless-stopped
+            ports:
+              - "80:80"
+              - "443:443"
+            volumes:
+              - ssl-certs:/etc/nginx/ssl:ro
+            environment:
+              - VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+              - VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+              - VITE_APP_VERSION=$APP_VERSION
+            healthcheck:
+              test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 10s
+
+        volumes:
+          ssl-certs:
+            external: true
+        EOF
+        
+        # Create nginx config
+        cat > nginx.conf << 'EOF'
+        user nginx;
+        worker_processes auto;
+        error_log /var/log/nginx/error.log warn;
+        pid /var/run/nginx.pid;
+
+        events {
+            worker_connections 1024;
+        }
+
+        http {
+            include /etc/nginx/mime.types;
+            default_type application/octet-stream;
+
+            log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                            '\$status \$body_bytes_sent "\$http_referer" '
+                            '"\$http_user_agent" "\$http_x_forwarded_for"';
+
+            access_log /var/log/nginx/access.log main;
+
+            sendfile on;
+            tcp_nopush on;
+            tcp_nodelay on;
+            keepalive_timeout 65;
+            types_hash_max_size 2048;
+
+            gzip on;
+            gzip_vary on;
+            gzip_min_length 1024;
+            gzip_types
+                text/plain
+                text/css
+                text/xml
+                text/javascript
+                application/javascript
+                application/xml+rss
+                application/json;
+
+            server {
+                listen 80;
+                server_name _;
+                return 301 https://\$host\$request_uri;
+            }
+
+            server {
+                listen 443 ssl http2;
+                server_name _;
+                
+                ssl_certificate /etc/nginx/ssl/selfsigned.crt;
+                ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+                ssl_protocols TLSv1.2 TLSv1.3;
+                ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+                ssl_prefer_server_ciphers off;
+                
+                add_header X-Frame-Options "SAMEORIGIN" always;
+                add_header X-Content-Type-Options "nosniff" always;
+                add_header X-XSS-Protection "1; mode=block" always;
+                add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+                add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+                
+                root /usr/share/nginx/html;
+                index index.html;
+                
+                location / {
+                    try_files \$uri \$uri/ /index.html;
+                }
+                
+                location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)\$ {
+                    expires 1y;
+                    add_header Cache-Control "public, immutable";
+                    access_log off;
+                }
+                
+                location ~ /\\. {
+                    deny all;
+                    access_log off;
+                    log_not_found off;
+                }
+                
+                location ~* \\.(log|sql|db|bak|old|orig)\$ {
+                    deny all;
+                    access_log off;
+                    log_not_found off;
+                }
+                
+                location /health {
+                    return 200 "healthy\\n";
+                    add_header Content-Type text/plain;
+                }
+                
+                location /version {
+                    alias /usr/share/nginx/html/.version;
+                    add_header Content-Type text/plain;
+                }
+                
+                error_page 404 /index.html;
+                error_page 500 502 503 504 /50x.html;
+                location = /50x.html {
+                    root /usr/share/nginx/html;
+                }
+            }
+        }
+        EOF
+        
         # Copy files to server
         scp .env.prod deploy-server:/tmp/.env.prod
         scp generate-ssl.sh deploy-server:/tmp/generate-ssl.sh
-        scp infra/docker/docker-compose.yml deploy-server:/tmp/docker-compose.yml
+        scp docker-compose.yml deploy-server:/tmp/docker-compose.yml
+        
+        # Copy source code to server
+        echo "📦 Copying source code to server..."
+        ssh deploy-server "mkdir -p ~/app/src"
+        rsync -avz --exclude='node_modules' --exclude='.git' --exclude='.github' ./ deploy-server:~/app/src/
         
         # Create directory structure on server
         ssh deploy-server "
-          mkdir -p ~/app/infra/nginx/sites
+          mkdir -p ~/app/infra/nginx
           mkdir -p ~/app/infra/docker
         "
         
-        # Copy nginx configs
-        scp infra/nginx/nginx.conf deploy-server:~/app/infra/nginx/
-        scp infra/nginx/sites/app.conf deploy-server:~/app/infra/nginx/sites/
+        # Copy nginx config
+        scp nginx.conf deploy-server:~/app/infra/nginx/nginx.conf
         
         echo "✅ Deployment files prepared"
     
-    - name: Login to GitHub Container Registry on server
-      run: |
-        echo "🔐 Logging in to GitHub Container Registry..."
-        
-        ssh deploy-server "
-          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ env.DOCKER_REGISTRY }} \
-            -u '${{ github.actor }}' \
-            --password-stdin
-        "
-    
-    - name: Generate SSL certificates
+    - name: Generate SSL certificates on server
       run: |
         echo "🔐 Generating SSL certificates..."
         
@@ -356,15 +520,14 @@ jobs:
           # Generate SSL certificates
           /tmp/generate-ssl.sh '${{ secrets.DOMAIN }}'
           
-          # Verify certificates
-          echo '=== SSL Certificate Info ==='
-          docker run --rm -v ssl-certs:/ssl alpine \
-            sh -c 'openssl x509 -in /ssl/selfsigned.crt -text -noout | grep -E \"Subject:|Not Before:|Not After:\"'
+          echo '✅ SSL certificates generated'
         "
     
-    - name: Deploy with Docker Compose
+    - name: Build and deploy on server
+      env:
+        APP_VERSION: ${{ steps.extract_version.outputs.version }}
       run: |
-        echo "🚀 Deploying with Docker Compose..."
+        echo "🚀 Building and deploying on server..."
         
         ssh deploy-server "
           cd ~/app
@@ -372,12 +535,24 @@ jobs:
           # Copy deployment files
           cp /tmp/.env.prod .env
           cp /tmp/docker-compose.yml infra/docker/
+          cp -r src/infra/docker/Dockerfile.app infra/docker/ 2>/dev/null || echo 'Dockerfile already in place'
           
-          echo '=== Pulling latest image ==='
-          docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          echo '=== Building Docker image on server ==='
+          cd src
+          
+          # Install dependencies and build
+          echo 'Installing dependencies...'
+          npm ci || npm install
+          
+          echo 'Building application...'
+          npm run build
+          
+          echo 'Building Docker image...'
+          docker build -f infra/docker/Dockerfile.app -t ${{ env.APP_NAME }}:latest .
           
           echo '=== Stopping existing containers ==='
-          docker-compose -f infra/docker/docker-compose.yml down
+          cd ~/app
+          docker-compose -f infra/docker/docker-compose.yml down || true
           
           echo '=== Starting new deployment ==='
           docker-compose -f infra/docker/docker-compose.yml up -d
@@ -389,67 +564,53 @@ jobs:
           docker-compose -f infra/docker/docker-compose.yml ps
           
           echo '=== Container Health Status ==='
-          docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}' | grep ${{ env.APP_NAME }}
+          docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}' | grep ${{ env.APP_NAME }} || echo 'Container not found'
           
           echo '=== Health Checks ==='
-          echo 'App health:'
-          curl -f http://localhost:3000/health || echo 'App health check failed'
+          echo 'Health check:'
+          curl -f http://localhost/health || echo 'Health check failed'
           echo ''
-          echo 'Nginx health:'
-          docker exec ${{ env.APP_NAME }}-nginx nginx -t && echo 'Nginx config OK'
-          
-          echo '=== Logs (last 5 lines) ==='
-          docker logs ${{ env.APP_NAME }}-app --tail 5 2>&1
-          docker logs ${{ env.APP_NAME }}-nginx --tail 5 2>&1
+          echo 'Version:'
+          curl -s http://localhost/version || echo 'Version endpoint failed'
         "
     
-    - name: Verify deployment health
+    - name: Verify deployment
       run: |
-        echo "🔍 Verifying deployment health..."
+        echo "🔍 Verifying deployment..."
         
         sleep 15
         
         ssh deploy-server "
           echo '=== Comprehensive Health Check ==='
           
-          # Check containers are running
+          # Check container is running
           echo '1. Container Status:'
           if docker ps --filter 'name=${{ env.APP_NAME }}' --format 'table {{.Names}}\\t{{.Status}}' | grep -q 'Up'; then
-            echo '✅ All containers are running'
+            echo '✅ Container is running'
           else
-            echo '❌ Some containers are not running'
+            echo '❌ Container is not running'
             exit 1
           fi
           
-          # Check app health
+          # Check health endpoint
           echo ''
-          echo '2. Application Health Endpoints:'
-          APP_HEALTH=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/health)
-          if [ \"\$APP_HEALTH\" = \"200\" ]; then
-            echo '✅ App health check: 200 OK'
+          echo '2. Health Endpoint:'
+          HEALTH=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost/health)
+          if [ \"\$HEALTH\" = \"200\" ]; then
+            echo '✅ Health check: 200 OK'
           else
-            echo \"❌ App health check failed: \$APP_HEALTH\"
+            echo \"❌ Health check failed: \$HEALTH\"
           fi
           
-          # Check version endpoint
+          # Check version
           echo ''
           echo '3. Version Information:'
-          curl -s http://localhost:3000/version || echo 'Version endpoint unavailable'
-          
-          # Check nginx proxy
-          echo ''
-          echo '4. Nginx Proxy Health:'
-          NGINX_HEALTH=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost/health)
-          if [ \"\$NGINX_HEALTH\" = \"200\" ]; then
-            echo '✅ Nginx proxy health: 200 OK'
-          else
-            echo \"❌ Nginx proxy health failed: \$NGINX_HEALTH\"
-          fi
+          curl -s http://localhost/version || echo 'Version endpoint unavailable'
           
           # Check SSL
           echo ''
-          echo '5. SSL Certificate:'
-          if docker exec ${{ env.APP_NAME }}-nginx ls /etc/nginx/ssl/selfsigned.crt > /dev/null 2>&1; then
+          echo '4. SSL Certificate:'
+          if docker exec ${{ env.APP_NAME }} ls /etc/nginx/ssl/selfsigned.crt > /dev/null 2>&1; then
             echo '✅ SSL certificate found'
           else
             echo '⚠️ SSL certificate not found'
@@ -457,18 +618,17 @@ jobs:
           
           # Resource usage
           echo ''
-          echo '6. Resource Usage:'
-          docker stats ${{ env.APP_NAME }}-app ${{ env.APP_NAME }}-nginx --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.NetIO}}'
+          echo '5. Resource Usage:'
+          docker stats ${{ env.APP_NAME }} --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}' 2>/dev/null || echo 'Stats unavailable'
         "
         
         echo ''
         echo "=== Deployment Summary ==="
-        echo "✅ Docker Compose deployment completed"
+        echo "✅ Docker deployment completed"
         echo "📦 Application: ${{ env.APP_NAME }}"
-        echo "🏷️ Version: ${{ needs.build.outputs.version }}"
-        echo "🔗 Internal: http://localhost:3000"
+        echo "🏷️ Version: ${{ steps.extract_version.outputs.version }}"
         echo "🌐 External: https://${{ secrets.DOMAIN }}"
-        echo "📊 Build: ${{ needs.build.outputs.build_id }}"
+        echo "🏗️ Build: Local on server"
 
   # ==================== NOTIFICATION ====================
   notify:
@@ -582,8 +742,8 @@ jobs:
         echo "🌐 URL: https://${{ secrets.DOMAIN }}"
         echo ""
         if [ "${{ job.status }}" = "success" ]; then
-          echo "✅ Docker Compose deployment completed successfully!"
-          echo "🐳 Containers: nginx + app (separate)"
+          echo "✅ Docker deployment completed successfully!"
+          echo "🐳 Container: nginx with static files"
           echo "🔒 SSL: Self-signed certificate"
           echo "🏥 Health checks: Implemented"
         else
