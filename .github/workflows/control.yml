@@ -1,0 +1,34 @@
+name: Container control
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: start | stop | restart
+        required: true
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Control containers
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          case "${{ github.event.inputs.action }}" in
+            start)
+              docker start app_blue app_green nginx || true
+              ;;
+            stop)
+              docker stop app_blue app_green nginx || true
+              ;;
+            restart)
+              docker restart app_blue app_green nginx || true
+              ;;
+            *)
+              echo "Unknown action"
+              exit 1
+          esac
