@@ -37,6 +37,8 @@ jobs:
       packages: write
     outputs:
       result: ${{ job.status }}
+      version: ${{ steps.set_outputs.outputs.version }}
+      build_id: ${{ steps.set_outputs.outputs.build_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +46,18 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
           | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set build outputs
+        id: set_outputs
+        run: |
+          VERSION=$(jq -r .version package.json)
+          BUILD_ID="${GITHUB_SHA::7}-$(date +%Y%m%d%H%M%S)"
+          echo "VERSION=$VERSION"
+          echo "BUILD_ID=$BUILD_ID"
+
+          # Устанавливаем outputs для использования в других job
+          echo "::set-output name=version::$VERSION"
+          echo "::set-output name=build_id::$BUILD_ID"
 
       - name: Build image
         run: |
@@ -114,60 +128,103 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set environment variables
+      - name: Send deployment notification
+        env:
+          APP_NAME: birthday-invitation
+          BUILD_STATUS: ${{ needs.build.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.result }}
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
+          BUILD_ID: ${{ needs.build.outputs.build_id }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VALIDATION: ${{ needs.validation.result }}
+          SECURITY: ${{ needs.security.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+
         run: |
-          VERSION=$(jq -r .version package.json)
-          SHORT_SHA=${GITHUB_SHA::7}
-          BUILD_ID="${SHORT_SHA}-$(date +%Y%m%d%H%M%S)"
-          DATE=$(date '+%d.%m.%Y %H:%M:%S')
-          COMMIT_AUTHOR="${{ github.event.head_commit.author.name }}"
-          COMMIT_MESSAGE="${{ github.event.head_commit.message }}"
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          SERVER_IP="${{ secrets.SERVER_IP }}"
-          DOMAIN="${{ secrets.DOMAIN }}"
+          echo "📨 Sending deployment notification..."
 
-          VALIDATION="${{ needs.validation.result }}"
-          SECURITY="${{ needs.security.result }}"
-          BUILD="${{ needs.build.result }}"
-          DEPLOY="${{ needs.deploy.result }}"
-
-          if [ "$DEPLOY" = "success" ]; then
-            STATUS="🟢 Статус: УСПЕШНО ✅"
+          # Определяем статус и иконки
+          if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
+            EMOJI="🎉"
+            STATUS_TEXT="<b>УСПЕШНО</b> ✅"
+            STATUS_ICON="🟢"
+          elif [ "$DEPLOY_STATUS" = "failure" ]; then
+            EMOJI="❌"
+            STATUS_TEXT="<b>ОШИБКА ДЕПЛОЯ</b> 🔴"
+            STATUS_ICON="🔴"
+          elif [ "$BUILD_STATUS" = "failure" ]; then
+            EMOJI="🚨"
+            STATUS_TEXT="<b>ОШИБКА СБОРКИ</b> 🟠"
+            STATUS_ICON="🟠"
           else
-            STATUS="🔴 Статус: ОШИБКА ❌"
+            EMOJI="⚠️"
+            STATUS_TEXT="<b>НЕИЗВЕСТНО</b> ⚪"
+            STATUS_ICON="⚪"
           fi
 
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-          echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
-          echo "DATE=$DATE" >> $GITHUB_ENV
-          echo "COMMIT_AUTHOR=$COMMIT_AUTHOR" >> $GITHUB_ENV
-          echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_ENV
-          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-          echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
-          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
-          echo "VALIDATION=$VALIDATION" >> $GITHUB_ENV
-          echo "SECURITY=$SECURITY" >> $GITHUB_ENV
-          echo "BUILD=$BUILD" >> $GITHUB_ENV
-          echo "DEPLOY=$DEPLOY" >> $GITHUB_ENV
-          echo "STATUS=$STATUS" >> $GITHUB_ENV
+          # Собираем инфу о коммите
+          COMMIT_SHA="${GITHUB_SHA:0:7}"
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          BRANCH="${GITHUB_REF#refs/heads/}"
 
-      - name: Send Telegram notification
-        run: |
-          # Составляем многострочное сообщение через переменную MESSAGE
-          MESSAGE="🎉 <b>Деплой birthday-invitation</b>\n$STATUS\n📦 Версия: <code>$VERSION</code>\n🏷️ Сборка: <code>$BUILD_ID</code>\n\n📝 <b>Информация о коммите:</b>\n└─ Ветка: <code>$BRANCH</code>\n└─ Коммит: <code>$SHORT_SHA</code>\n└─ Автор: $COMMIT_AUTHOR\n└─ Сообщение: $COMMIT_MESSAGE\n\n🌐 <b>Доступ к приложению:</b>\n• https://$DOMAIN\n• http://$SERVER_IP\n\n🔧 <b>Проверка здоровья:</b>\n• https://$DOMAIN/health\n• https://$DOMAIN/version\n\n📊 <b>Статусы:</b>\n• Валидация: $VALIDATION\n• Безопасность: $SECURITY\n• Сборка: $BUILD\n• Деплой: $DEPLOY\n\n🕐 <i>$DATE</i>"
-
+          
+          # Формируем сообщение с правильным форматированием
+          cat > message.txt << 'EOF'
+          $EMOJI <b>Деплой birthday-invitation</b>
+          
+          $STATUS_ICON Статус: $STATUS_TEXT
+          📦 Версия: <code>$BUILD_VERSION</code>
+          🏷️ Сборка: <code>$BUILD_ID</code>
+          
+          📝 <b>Информация о коммите:</b>
+          └─ Ветка: <code>$BRANCH</code>
+          └─ Коммит: <code>$COMMIT_SHA</code>
+          └─ Автор: $COMMIT_AUTHOR
+          └─ Сообщение: $COMMIT_MESSAGE
+          
+          🌐 <b>Доступ к приложению:</b>
+          • https://${{ secrets.DOMAIN }}
+          • http://${{ secrets.SERVER_IP }}
+          
+          🔧 <b>Проверка здоровья:</b>
+          • https://${{ secrets.DOMAIN }}/health
+          • https://${{ secrets.DOMAIN }}/version
+          
+          📊 <b>Статусы:</b>
+          • Валидация: ${{ needs.validation.result }}
+          • Безопасность: ${{ needs.security.result }}
+          • Сборка: ${{ needs.build.result }}
+          • Деплой: ${{ needs.deploy.result }}
+          
+          🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>
+          EOF
+          
+          # Подставляем переменные
+          MESSAGE=$(envsubst < message.txt)
+          
+          # Отправляем в Telegram
+          echo "Sending to Telegram..."
+          
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n \
-                  --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
-                  --arg text "$MESSAGE" \
-                  --arg parse_mode "HTML" \
-                  '{
-                    chat_id: $chat_id,
-                    text: $text,
-                    parse_mode: $parse_mode,
-                    disable_web_page_preview: true
-                  }')"
-
+            -d "{
+              \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+              \"text\": \"$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g')\",
+              \"parse_mode\": \"HTML\",
+              \"disable_web_page_preview\": true,
+              \"reply_markup\": {
+                \"inline_keyboard\": [
+                  [
+                    {\"text\": \"🌐 Открыть приложение\", \"url\": \"https://${{ secrets.DOMAIN }}\"},
+                    {\"text\": \"📊 Посмотреть логи\", \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}
+                  ]
+                ]
+              }
+            }"
+          
           echo "✅ Notification sent to Telegram"
+          rm -f message.txt
