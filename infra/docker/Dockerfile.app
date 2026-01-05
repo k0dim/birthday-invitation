@@ -3,9 +3,11 @@ FROM node:20-alpine as build
 
 WORKDIR /app
 
-# Копируем package.json и устанавливаем зависимости
+# Копируем package.json и package-lock.json
 COPY package*.json ./
-RUN npm ci --only=production
+
+# Устанавливаем ВСЕ зависимости (включая devDependencies)
+RUN npm ci
 
 # Копируем исходный код
 COPY . .
@@ -14,7 +16,8 @@ COPY . .
 RUN npm run build
 
 # Создаем файл с метаданными
-RUN echo "version=$(node -p "require('./package.json').version")" > /app/dist/build-info.txt && \
+RUN VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\([^"]*\).*/\1/') && \
+    echo "version=$VERSION" > /app/dist/build-info.txt && \
     echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> /app/dist/build-info.txt && \
     echo "commit=${GITHUB_SHA:-local-build}" >> /app/dist/build-info.txt && \
     echo "$(date -u +'%Y%m%d%H%M%S')" > /app/dist/.version
