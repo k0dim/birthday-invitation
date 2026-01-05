@@ -1,5 +1,12 @@
 name: 🚀 Production Deployment Pipeline
 
+# Настройка прав доступа для всего workflow
+permissions:
+  contents: read
+  actions: write  # ← для удаления артефактов
+  deployments: write
+  statuses: write
+
 on:
   push:
     branches: [ main, master ]
