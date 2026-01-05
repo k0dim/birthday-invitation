@@ -224,6 +224,51 @@ jobs:
         # Test connection
         ssh deploy-server "echo '✅ SSH connection successful'"
     
+    - name: Debug file structure
+      run: |
+        echo "🔍 DEBUG: Checking file structure..."
+        echo "=== Current directory ==="
+        pwd
+        echo ""
+        echo "=== Full directory listing ==="
+        ls -la
+        echo ""
+        echo "=== Checking infra directory ==="
+        if [ -d "infra" ]; then
+          echo "infra/ exists"
+          ls -la infra/
+          echo ""
+          echo "=== Checking infra/docker ==="
+          if [ -d "infra/docker" ]; then
+            echo "infra/docker/ exists"
+            ls -la infra/docker/
+            echo ""
+            echo "=== Checking docker-compose.yml ==="
+            if [ -f "infra/docker/docker-compose.yml" ]; then
+              echo "✅ FILE EXISTS: infra/docker/docker-compose.yml"
+              echo "=== File permissions ==="
+              stat infra/docker/docker-compose.yml
+              echo ""
+              echo "=== First 5 lines ==="
+              head -5 infra/docker/docker-compose.yml
+            else
+              echo "❌ FILE NOT FOUND: infra/docker/docker-compose.yml"
+              echo "=== Looking for any docker-compose files ==="
+              find . -name "*docker-compose*" -type f 2>/dev/null
+            fi
+          else
+            echo "❌ infra/docker/ does not exist"
+          fi
+        else
+          echo "❌ infra/ does not exist"
+        fi
+        echo ""
+        echo "=== Git status ==="
+        git status --short 2>/dev/null || echo "git not available"
+        echo ""
+        echo "=== Git log (last 3) ==="
+        git log --oneline -3 2>/dev/null || echo "git not available"
+        
     - name: Prepare deployment files
       run: |
         echo "📁 Preparing deployment files..."
