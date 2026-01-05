@@ -548,102 +548,90 @@ jobs:
       run: |
         echo "⚙️  Configuring final Nginx..."
         
-        # Проверяем, есть ли SSL сертификат
+        # Проверяем SSL
         SSL_STATUS=$(ssh deploy-server "if [ -f /etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem ]; then echo 'ssl'; else echo 'http'; fi")
         
         if [ "$SSL_STATUS" = "ssl" ]; then
           echo "✅ SSL certificate found, configuring HTTPS..."
           
-          # Создаем SSL конфиг с правильным EOF
-          cat << 'NGINX_SSL_EOF' > nginx-ssl.conf
-          server {
-              listen 80;
-              server_name __DOMAIN__ www.__DOMAIN__;
-              return 301 https://$server_name$request_uri;
-          }
-          
-          server {
-              listen 443 ssl http2;
-              server_name __DOMAIN__ www.__DOMAIN__;
-              
-              ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
-              
-              root __DEPLOY_PATH__/dist;
-              index index.html;
-              
-              # Security headers
-              add_header X-Frame-Options "SAMEORIGIN" always;
-              add_header X-Content-Type-Options "nosniff" always;
-              
-              # SPA routing
-              location / {
-                  try_files $uri $uri/ /index.html;
-              }
-              
-              # Static assets
-              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
-                  expires 1y;
-                  add_header Cache-Control "public, immutable";
-                  access_log off;
-              }
-              
-              location /health { return 200 "healthy\n"; }
-              location /version { alias __DEPLOY_PATH__/dist/.version; }
-          }
-          NGINX_SSL_EOF
-          
-          CONFIG_FILE="nginx-ssl.conf"
+          # SSL конфиг
+          cat > nginx.conf << EOF
+        server {
+            listen 80;
+            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
+            return 301 https://\$server_name\$request_uri;
+        }
+
+        server {
+            listen 443 ssl http2;
+            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
+            
+            ssl_certificate /etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem;
+            ssl_certificate_key /etc/letsencrypt/live/${{ secrets.DOMAIN }}/privkey.pem;
+            
+            root ${{ env.DEPLOY_PATH }}/dist;
+            index index.html;
+            
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            
+            location / {
+                try_files \$uri \$uri/ /index.html;
+            }
+            
+            location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)\$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                access_log off;
+            }
+            
+            location /health { return 200 "healthy\\n"; }
+            location /version { alias ${{ env.DEPLOY_PATH }}/dist/.version; }
+        }
+        EOF
         else
           echo "⚠️  No SSL certificate, using HTTP only"
           
-          # Создаем HTTP конфиг
-          cat << 'NGINX_HTTP_EOF' > nginx-http-only.conf
+          # HTTP конфиг
+          cat > nginx.conf << EOF
           server {
               listen 80;
-              server_name __DOMAIN__ www.__DOMAIN__;
+              server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
               
-              root __DEPLOY_PATH__/dist;
+              root ${{ env.DEPLOY_PATH }}/dist;
               index index.html;
               
               add_header X-Frame-Options "SAMEORIGIN" always;
               add_header X-Content-Type-Options "nosniff" always;
               
               location / {
-                  try_files $uri $uri/ /index.html;
+                  try_files \$uri \$uri/ /index.html;
               }
               
-              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
+              location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)\$ {
                   expires 1y;
                   add_header Cache-Control "public, immutable";
                   access_log off;
               }
               
-              location /health { return 200 "healthy\n"; }
-              location /version { alias __DEPLOY_PATH__/dist/.version; }
+              location /health { return 200 "healthy\\n"; }
+              location /version { alias ${{ env.DEPLOY_PATH }}/dist/.version; }
           }
-          NGINX_HTTP_EOF
-          
-          CONFIG_FILE="nginx-http-only.conf"
+        EOF
         fi
         
-        # Заменяем переменные
-        sed -i "s|__DOMAIN__|${{ secrets.DOMAIN }}|g" "$CONFIG_FILE"
-        sed -i "s|__DEPLOY_PATH__|${{ env.DEPLOY_PATH }}|g" "$CONFIG_FILE"
+        # Копируем и применяем
+        scp nginx.conf deploy-server:/tmp/nginx.conf
         
-        # Копируем на сервер
-        scp "$CONFIG_FILE" deploy-server:/tmp/nginx-final.conf
-        
-        # Применяем конфиг
         ssh deploy-server '
-          sudo cp /tmp/nginx-final.conf /etc/nginx/sites-available/birthday-invitation
+          sudo cp /tmp/nginx.conf /etc/nginx/sites-available/birthday-invitation
           sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
           sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
           sudo nginx -t && sudo systemctl reload nginx
-          echo "✅ Nginx configured successfully"
+          echo "✅ Nginx configured"
         '
         
-        rm -f "$CONFIG_FILE"
+        rm -f nginx.conf
 
     - name: Configure Nginx (if Let's Encrypt failed)
       if: failure()
