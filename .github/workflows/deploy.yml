@@ -3,7 +3,7 @@ name: 🚀 Production Deployment Pipeline
 # Настройка прав доступа для всего workflow
 permissions:
   contents: read
-  actions: write  # ← для удаления артефактов
+  actions: write
   deployments: write
   statuses: write
 
@@ -12,7 +12,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # Ручной запуск
+  workflow_dispatch:
     inputs:
       environment:
         description: 'Environment to deploy to'
@@ -28,26 +28,15 @@ on:
         default: false
         type: boolean
 
-# Отмена предыдущих запусков того же workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # Global environment variables
   APP_NAME: 'birthday-invitation'
   NODE_VERSION: '20'
-  PNPM_VERSION: '8'
-  
-  # Deployment paths
-  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-  DEPLOY_PATH: '/var/www/birthday-invitation'
-  BACKUP_PATH: '/var/backups/birthday-invitation'
-  
-  # Nginx
-  NGINX_SITES_AVAILABLE: '/etc/nginx/sites-available'
-  NGINX_SITES_ENABLED: '/etc/nginx/sites-enabled'
-  NGINX_SITE_NAME: 'birthday-invitation'
+  DOCKER_REGISTRY: 'ghcr.io'
+  DOCKER_IMAGE_NAME: '${{ github.repository }}'
 
 jobs:
   # ==================== VALIDATION ====================
@@ -62,260 +51,97 @@ jobs:
       with:
         fetch-depth: 0
     
-    - name: Validate branch protection
-      if: github.event_name == 'push'
+    - name: Validate Docker files
       run: |
-        echo "🔒 Validating branch: ${{ github.ref }}"
-        if [[ "${{ github.ref }}" != "refs/heads/main" && "${{ github.ref }}" != "refs/heads/master" ]]; then
-          echo "⚠️  Only main/master branches can be deployed to production"
-          exit 1
-        fi
-    
-    - name: Validate secrets
-      run: |
-        echo "🔐 Validating required secrets..."
-        required_secrets=(
-          "TELEGRAM_BOT_TOKEN"
-          "TELEGRAM_CHAT_ID"
-          "SERVER_IP"
-          "DEPLOY_USER"
-          "SSH_PRIVATE_KEY"
-          "DOMAIN"
+        echo "🐳 Validating Docker configuration..."
+        
+        required_docker_files=(
+          "infra/docker/Dockerfile"
+          "infra/docker/docker-compose.yml"
+          "infra/nginx/nginx.conf"
+          "infra/nginx/default.conf"
         )
         
-        for secret in "${required_secrets[@]}"; do
-          if [ -z "${secret}" ]; then
-            echo "❌ Missing secret: $secret"
+        for file in "${required_docker_files[@]}"; do
+          if [ ! -f "$file" ]; then
+            echo "❌ Missing Docker file: $file"
             exit 1
           else
-            echo "✅ $secret: Configured"
+            echo "✅ $file found"
           fi
         done
         
-        echo "✅ All secrets validated"
-    
-    - name: Validate package.json
-      run: |
-        echo "📦 Validating package.json..."
-        if [ ! -f "package.json" ]; then
-          echo "❌ package.json not found"
-          exit 1
+        # Проверяем Dockerfile
+        if ! grep -q "FROM nginx" infra/docker/Dockerfile; then
+          echo "⚠️ Dockerfile might be misconfigured"
         fi
         
-        # Проверяем обязательные поля
-        jq -e '.name' package.json > /dev/null || (echo "❌ Missing name in package.json" && exit 1)
-        jq -e '.version' package.json > /dev/null || (echo "❌ Missing version in package.json" && exit 1)
-        jq -e '.scripts.build' package.json > /dev/null || (echo "❌ Missing build script in package.json" && exit 1)
-        
-        echo "✅ package.json is valid"
-    
-    - name: Code quality check
-      run: |
-        echo "📝 Checking code quality..."
-        
-        # Проверяем наличие обязательных файлов
-        required_files=(
-          "src/App.jsx"
-          "src/main.jsx"
-          "src/index.css"
-          "index.html"
-          "vite.config.js"
-        )
-        
-        for file in "${required_files[@]}"; do
-          if [ ! -f "$file" ]; then
-            echo "⚠️  Missing recommended file: $file"
-          fi
-        done
-        
-        # Простая проверка на пустые файлы
-        find src -name "*.jsx" -o -name "*.js" | while read file; do
-          if [ ! -s "$file" ]; then
-            echo "⚠️  Empty file: $file"
-          fi
-        done
-        
-        echo "✅ Code quality check passed"
+        echo "✅ Docker configuration validated"
 
-  # ==================== SECURITY SCAN ====================
-  security:
-    name: 🔒 Security Scan
-    runs-on: ubuntu-latest
-    needs: validate
-    timeout-minutes: 10
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Dependency audit
-      run: |
-        echo "🛡️  Running dependency audit..."
-        npm audit --audit-level=moderate || echo "⚠️  Audit found vulnerabilities"
-    
-    - name: Check for exposed secrets
-      run: |
-        echo "🔍 Checking for exposed secrets..."
-        # Простая проверка на случайные секреты в коде
-        forbidden_patterns=(
-          "password.*="
-          "token.*="
-          "secret.*="
-          "api[_-]key"
-          "ssh[_-]key"
-          "private[_-]key"
-        )
-        
-        for pattern in "${forbidden_patterns[@]}"; do
-          echo "Checking pattern: $pattern"
-          if grep -r -i "$pattern" --include="*.js" --include="*.jsx" --include="*.json" --include="*.env*" . | grep -v "node_modules" | grep -v ".git"; then
-            echo "⚠️  Potential secret found with pattern: $pattern"
-          fi
-        done
-        
-        echo "✅ Secret scan completed"
-    
-    - name: Check environment files
-      run: |
-        echo "📁 Checking environment files..."
-        # Убедимся что .env.local не закоммичен
-        if [ -f ".env.local" ]; then
-          echo "❌ .env.local should not be committed to repository!"
-          exit 1
-        fi
-        
-        # Проверяем наличие .env.example
-        if [ ! -f ".env.example" ]; then
-          echo "❌ .env.example is missing!"
-          exit 1
-        fi
-        
-        echo "✅ Environment files check passed"
-
-  # ==================== BUILD ====================
+  # ==================== BUILD DOCKER ====================
   build:
-    name: 🏗️ Build
+    name: 🐳 Build Docker Image
     runs-on: ubuntu-latest
-    needs: [validate, security]
-    timeout-minutes: 15
+    needs: [validate]
     outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
       version: ${{ steps.extract_version.outputs.version }}
-      build_id: ${{ steps.generate_build_id.outputs.build_id }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
-    
-    - name: Setup pnpm (optional)
-      uses: pnpm/action-setup@v2
-      with:
-        version: ${{ env.PNPM_VERSION }}
     
     - name: Extract version
       id: extract_version
       run: |
-        VERSION=$(node -p "require('./package.json').version")
+        VERSION=$(node -p "require('./package.json').version 2>/dev/null || '1.0.0'")
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "📦 Version: $VERSION"
     
-    - name: Generate build ID
-      id: generate_build_id
-      run: |
-        BUILD_ID="${GITHUB_SHA:0:7}-$(date +%Y%m%d%H%M%S)"
-        echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
-        echo "🏷️ Build ID: $BUILD_ID"
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
     
-    - name: Install dependencies
-      run: |
-        echo "📦 Installing dependencies..."
-        npm ci --prefer-offline --no-audit
-        
-        # Проверяем зависимости
-        echo "Dependencies installed:"
-        npm list --depth=0
-    
-    - name: Build application
-      env:
-        VITE_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        VITE_TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        VITE_APP_VERSION: ${{ steps.extract_version.outputs.version }}
-        VITE_BUILD_ID: ${{ steps.generate_build_id.outputs.build_id }}
-        VITE_BUILD_DATE: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        VITE_COMMIT_SHA: ${{ github.sha }}
-        VITE_ENVIRONMENT: production
-      run: |
-        echo "🚀 Building application with environment variables..."
-        echo "Version: $VITE_APP_VERSION"
-        echo "Build ID: $VITE_BUILD_ID"
-        echo "Commit: $VITE_COMMIT_SHA"
-        
-        # Сборка
-        npm run build
-        
-        # Проверка сборки
-        echo "📁 Build output:"
-        ls -la dist/
-        du -sh dist/
-        
-        # Проверяем наличие index.html
-        if [ ! -f "dist/index.html" ]; then
-          echo "❌ dist/index.html not found!"
-          exit 1
-        fi
-    
-    - name: Run tests
-      if: ${{ !inputs.force || github.event.inputs.force != 'true' }}
-      run: |
-        echo "🧪 Running tests..."
-        # Если есть тесты
-        if [ -f "package.json" ] && jq -e '.scripts.test' package.json > /dev/null; then
-          npm test
-        else
-          echo "⚠️  No tests configured, skipping..."
-        fi
-    
-    - name: Create build manifest
-      run: |
-        echo "📄 Creating build manifest..."
-        
-        cat > dist/build-manifest.json << EOF
-        {
-          "application": "birthday-invitation",
-          "version": "${{ steps.extract_version.outputs.version }}",
-          "buildId": "${{ steps.generate_build_id.outputs.build_id }}",
-          "commitSha": "${{ github.sha }}",
-          "commitMessage": "${{ github.event.head_commit.message }}",
-          "branch": "${{ github.ref_name }}",
-          "builtAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-          "builtBy": "${{ github.actor }}",
-          "environment": "production"
-        }
-        EOF
-        
-        echo "✅ Build manifest created"
-    
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
       with:
-        name: build-${{ steps.generate_build_id.outputs.build_id }}
-        path: |
-          dist/
-          package.json
-          package-lock.json
-        retention-days: 30
-        if-no-files-found: error
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{sha}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value=${{ steps.extract_version.outputs.version }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./infra/docker/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          VITE_APP_VERSION=${{ steps.extract_version.outputs.version }}
+    
+    - name: Verify pushed image
+      run: |
+        echo "✅ Docker image built and pushed"
+        echo "Tags: ${{ steps.meta.outputs.tags }}"
 
-  # ==================== DEPLOY ====================
+  # ==================== DEPLOY DOCKER ====================
   deploy:
-    name: 🚀 Deploy to Production
+    name: 🚀 Deploy Docker Container
     runs-on: ubuntu-latest
     needs: [build]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
@@ -325,666 +151,326 @@ jobs:
       url: https://${{ vars.DOMAIN }}
     
     steps:
-    - name: Download build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: build-${{ needs.build.outputs.build_id }}
-    
-    - name: Setup SSH with advanced configuration
+    - name: Setup SSH
       run: |
         echo "🔐 Setting up SSH connection..."
         
-        # Создаем директорию и ключ
         mkdir -p ~/.ssh
         echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-        
-        # Проверяем формат ключа
-        echo "🔍 Validating SSH key..."
-        head -1 ~/.ssh/deploy_key
-        tail -1 ~/.ssh/deploy_key
-        
-        # Устанавливаем права
         chmod 600 ~/.ssh/deploy_key
         
-        # Генерируем публичный ключ для отладки
-        ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub
-        echo "Public key fingerprint:"
-        ssh-keygen -l -f ~/.ssh/deploy_key
-        
-        # Создаем конфигурацию
         cat >> ~/.ssh/config << EOF
         Host deploy-server
           HostName ${{ secrets.SERVER_IP }}
-          User ${{ env.DEPLOY_USER }}
+          User ${{ secrets.DEPLOY_USER }}
           IdentityFile ~/.ssh/deploy_key
           Port 22
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null
-          ConnectTimeout 30
-          ServerAliveInterval 60
-          ServerAliveCountMax 3
-          LogLevel ERROR
         EOF
         
         chmod 600 ~/.ssh/config
-        
-        echo "✅ SSH setup completed"
     
     - name: Verify server connectivity
       run: |
         echo "🔍 Testing server connectivity..."
-        
-        # Проверяем базовое подключение
         ssh deploy-server "echo '✅ SSH connection successful!'"
-        
-        # Проверяем системные требования
         ssh deploy-server "
-          echo '=== Server Information ==='
-          echo 'Hostname: \$(hostname)'
-          echo 'Uptime: \$(uptime -p)'
-          echo 'OS: \$(lsb_release -d | cut -f2)'
-          echo 'Kernel: \$(uname -r)'
+          echo '=== Docker Status ==='
+          docker --version
+          docker-compose --version
           echo ''
           echo '=== Disk Space ==='
-          df -h /var /home
-          echo ''
-          echo '=== Memory ==='
-          free -h
-          echo ''
-          echo '=== Nginx Status ==='
-          if command -v nginx &> /dev/null; then
-            nginx -v
-            sudo systemctl is-active nginx
-          else
-            echo '❌ Nginx not installed'
-          fi
+          df -h
         "
     
-    - name: Create backup before deployment
+    - name: Prepare deployment files on server
       run: |
-        echo "💾 Creating backup..."
+        echo "📁 Preparing deployment directory on server..."
         
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        BACKUP_NAME="birthday-invitation_backup_$TIMESTAMP.tar.gz"
+        # Копируем Docker Compose файлы на сервер
+        scp infra/docker/docker-compose.yml deploy-server:/tmp/docker-compose.yml
         
-        ssh deploy-server "
-          echo 'Creating backup of current deployment...'
-          
-          # Создаем директорию для бэкапов если нет
-          sudo mkdir -p ${{ env.BACKUP_PATH }}
-          
-          # Создаем бэкап текущей версии
-          if [ -d \"${{ env.DEPLOY_PATH }}/dist\" ]; then
-            sudo tar -czf \"${{ env.BACKUP_PATH }}/$BACKUP_NAME\" -C \"${{ env.DEPLOY_PATH }}\" dist/
-            echo \"✅ Backup created: $BACKUP_NAME\"
-            echo \"Backup size: \$(du -h ${{ env.BACKUP_PATH }}/$BACKUP_NAME | cut -f1)\"
-            
-            # Сохраняем последние 5 бэкапов
-            echo 'Cleaning old backups (keeping last 5)...'
-            sudo ls -t ${{ env.BACKUP_PATH }}/birthday-invitation_backup_*.tar.gz 2>/dev/null | tail -n +6 | sudo xargs -r rm
-            echo 'Current backups:'
-            sudo ls -lh ${{ env.BACKUP_PATH }}/birthday-invitation_backup_*.tar.gz 2>/dev/null || echo 'No previous backups'
-          else
-            echo '⚠️  No existing deployment found, skipping backup'
-          fi
-        "
-    
-    - name: Prepare deployment directory
-      run: |
-        echo "📁 Preparing deployment directory..."
+        # Создаем production docker-compose.prod.yml
+        cat > docker-compose.prod.yml << 'EOF'
+        version: '3.8'
+
+        services:
+          birthday-invitation:
+            image: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+            container_name: ${{ env.APP_NAME }}-prod
+            restart: unless-stopped
+            ports:
+              - "80:80"
+              - "443:443"
+            volumes:
+              - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+              - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+              - ssl-certs:/etc/nginx/ssl:ro
+            environment:
+              - VITE_TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+              - VITE_TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+            networks:
+              - web-network
+
+        volumes:
+          ssl-certs:
+            external: true
+
+        networks:
+          web-network:
+            driver: bridge
+        EOF
         
-        ssh deploy-server "
-          # Создаем директорию если нет
-          sudo mkdir -p ${{ env.DEPLOY_PATH }}
-          sudo chown -R ${{ env.DEPLOY_USER }}:${{ env.DEPLOY_USER }} ${{ env.DEPLOY_PATH }}
-          
-          # Создаем структуру директорий
-          mkdir -p ${{ env.DEPLOY_PATH }}/dist
-          mkdir -p ${{ env.DEPLOY_PATH }}/logs
-          mkdir -p ${{ env.DEPLOY_PATH }}/config
-          
-          # Создаем симлинк для текущей версии
-          ln -sfn ${{ env.DEPLOY_PATH }}/dist ${{ env.DEPLOY_PATH }}/current
-          
-          echo 'Directory structure:'
-          ls -la ${{ env.DEPLOY_PATH }}/
-        "
-    
-    - name: Deploy application files
-      run: |
-        echo "📤 Deploying application files..."
+        # Создаем скрипт генерации SSL
+        cat > generate-ssl.sh << 'EOF'
+        #!/bin/bash
+        set -e
         
-        # Создаем временную директорию для деплоя
-        DEPLOY_TEMP_DIR="/tmp/deploy_${{ needs.build.outputs.build_id }}"
-        mkdir -p $DEPLOY_TEMP_DIR
+        DOMAIN="${{ secrets.DOMAIN }}"
+        SSL_DIR="./ssl-certs"
         
-        # Копируем файлы сборки
-        cp -r dist/* $DEPLOY_TEMP_DIR/
+        echo "🔐 Generating self-signed SSL certificate for \$DOMAIN..."
         
-        # Создаем файл версии
-        echo "${{ needs.build.outputs.build_id }}" > $DEPLOY_TEMP_DIR/.version
+        mkdir -p \$SSL_DIR
+        
+        # Generate private key
+        openssl genrsa -out \$SSL_DIR/selfsigned.key 2048
+        
+        # Generate CSR
+        openssl req -new -key \$SSL_DIR/selfsigned.key -out \$SSL_DIR/selfsigned.csr \
+          -subj "/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=\$DOMAIN"
+        
+        # Generate self-signed certificate
+        openssl x509 -req -days 365 -in \$SSL_DIR/selfsigned.csr \
+          -signkey \$SSL_DIR/selfsigned.key -out \$SSL_DIR/selfsigned.crt
+        
+        # Set permissions
+        chmod 600 \$SSL_DIR/selfsigned.key
+        chmod 644 \$SSL_DIR/selfsigned.crt
+        
+        # Create Docker volume
+        docker volume create ssl-certs
+        docker run --rm -v ssl-certs:/target -v \$(pwd)/\$SSL_DIR:/source alpine \
+          sh -c "cp -r /source/* /target/"
+        
+        echo "✅ SSL certificate generated and stored in Docker volume"
+        EOF
+        
+        chmod +x generate-ssl.sh
         
         # Копируем на сервер
-        echo "Copying files to server..."
-        scp -r $DEPLOY_TEMP_DIR/* deploy-server:${{ env.DEPLOY_PATH }}/dist/
+        scp docker-compose.prod.yml deploy-server:/tmp/docker-compose.prod.yml
+        scp generate-ssl.sh deploy-server:/tmp/generate-ssl.sh
         
-        # Устанавливаем правильные права
+        # Копируем Nginx конфиги
+        ssh deploy-server "mkdir -p ~/app/infra/nginx"
+        scp infra/nginx/nginx.conf deploy-server:~/app/infra/nginx/
+        scp infra/nginx/default.conf deploy-server:~/app/infra/nginx/
+        
+        # Обновляем default.conf с правильным root
         ssh deploy-server "
-          echo 'Setting file permissions...'
-          sudo chown -R www-data:www-data ${{ env.DEPLOY_PATH }}/dist
-          sudo find ${{ env.DEPLOY_PATH }}/dist -type f -exec chmod 644 {} \;
-          sudo find ${{ env.DEPLOY_PATH }}/dist -type d -exec chmod 755 {} \;
-          
-          echo 'Deployed files:'
-          ls -la ${{ env.DEPLOY_PATH }}/dist/ | head -15
-          echo ''
-          echo 'Total size:'
-          du -sh ${{ env.DEPLOY_PATH }}/dist/
-        "
-        
-        # Очищаем временные файлы
-        rm -rf $DEPLOY_TEMP_DIR
-        
-        echo "✅ Files deployed successfully"
-    
-    - name: Setup SSL with Let's Encrypt
-      run: |
-        echo "🔐 Setting up SSL with Let's Encrypt..."
-        
-        # Создаем простой HTTP конфиг для certbot
-        cat > nginx-http.conf << 'EOF'
+          cat > ~/app/infra/nginx/default.conf << 'NGINX_CONFIG'
         server {
             listen 80;
-            server_name $DOMAIN www.$DOMAIN;
-            root $DEPLOY_PATH/dist;
-            index index.html;
+            listen [::]:80;
+            server_name _;
             
-            location /.well-known/acme-challenge/ {
-                root /var/www/html;
-            }
+            root /usr/share/nginx/html;
+            index index.html index.htm;
             
-            location / {
-                try_files $uri $uri/ /index.html;
-            }
-        }
-        EOF
-        
-        # Заменяем переменные в конфиге
-        sed -i "s|\$DOMAIN|${{ secrets.DOMAIN }}|g" nginx-http.conf
-        sed -i "s|\$DEPLOY_PATH|${{ env.DEPLOY_PATH }}|g" nginx-http.conf
-        
-        # Копируем на сервер
-        scp nginx-http.conf deploy-server:/tmp/nginx-http.conf
-        
-        # Выполняем команды на сервере
-        ssh deploy-server << 'REMOTE_EOF'
-          echo "📦 Preparing for Let's Encrypt..."
-          
-          # Отключаем текущий сайт
-          sudo rm -f /etc/nginx/sites-enabled/birthday-invitation 2>/dev/null || true
-          
-          # Устанавливаем временный HTTP конфиг
-          sudo cp /tmp/nginx-http.conf /etc/nginx/sites-available/birthday-invitation
-          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
-          
-          # Перезагружаем nginx
-          sudo nginx -t && sudo systemctl reload nginx
-          echo "✅ Temporary HTTP config applied"
-          
-          # Устанавливаем certbot если нет
-          if ! command -v certbot &> /dev/null; then
-            echo "Installing certbot..."
-            sudo apt-get update
-            sudo apt-get install -y certbot python3-certbot-nginx
-          fi
-          
-          # Получаем сертификат
-          echo "📝 Obtaining SSL certificate..."
-          sudo certbot --nginx --non-interactive --agree-tos \
-            --email admin@${{ secrets.DOMAIN }} \
-            -d ${{ secrets.DOMAIN }} \
-            -d www.${{ secrets.DOMAIN }} \
-            --redirect || echo "⚠️ Certbot failed, will use HTTP"
-          
-          echo "✅ Let's Encrypt setup attempted"
-        REMOTE_EOF
-        
-        rm -f nginx-http.conf
-
-    - name: Configure final Nginx
-      run: |
-        echo "⚙️  Configuring final Nginx..."
-        
-        # Проверяем SSL
-        SSL_STATUS=$(ssh deploy-server "if [ -f /etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem ]; then echo 'ssl'; else echo 'http'; fi")
-        
-        if [ "$SSL_STATUS" = "ssl" ]; then
-          echo "✅ SSL certificate found, configuring HTTPS..."
-          
-          # SSL конфиг
-          cat > nginx.conf << EOF
-        server {
-            listen 80;
-            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            return 301 https://\$server_name\$request_uri;
-        }
-
-        server {
-            listen 443 ssl http2;
-            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            
-            ssl_certificate /etc/letsencrypt/live/${{ secrets.DOMAIN }}/fullchain.pem;
-            ssl_certificate_key /etc/letsencrypt/live/${{ secrets.DOMAIN }}/privkey.pem;
-            
-            root ${{ env.DEPLOY_PATH }}/dist;
-            index index.html;
-            
-            add_header X-Frame-Options "SAMEORIGIN" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            
-            location / {
-                try_files \$uri \$uri/ /index.html;
-            }
-            
-            location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)\$ {
-                expires 1y;
-                add_header Cache-Control "public, immutable";
-                access_log off;
-            }
-            
-            location /health { return 200 "healthy\\n"; }
-            location /version { alias ${{ env.DEPLOY_PATH }}/dist/.version; }
-        }
-        EOF
-        else
-          echo "⚠️  No SSL certificate, using HTTP only"
-          
-          # HTTP конфиг
-          cat > nginx.conf << EOF
-          server {
-              listen 80;
-              server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-              
-              root ${{ env.DEPLOY_PATH }}/dist;
-              index index.html;
-              
-              add_header X-Frame-Options "SAMEORIGIN" always;
-              add_header X-Content-Type-Options "nosniff" always;
-              
-              location / {
-                  try_files \$uri \$uri/ /index.html;
-              }
-              
-              location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)\$ {
-                  expires 1y;
-                  add_header Cache-Control "public, immutable";
-                  access_log off;
-              }
-              
-              location /health { return 200 "healthy\\n"; }
-              location /version { alias ${{ env.DEPLOY_PATH }}/dist/.version; }
-          }
-        EOF
-        fi
-        
-        # Копируем и применяем
-        scp nginx.conf deploy-server:/tmp/nginx.conf
-        
-        ssh deploy-server '
-          sudo cp /tmp/nginx.conf /etc/nginx/sites-available/birthday-invitation
-          sudo ln -sf /etc/nginx/sites-available/birthday-invitation /etc/nginx/sites-enabled/
-          sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-          sudo nginx -t && sudo systemctl reload nginx
-          echo "✅ Nginx configured"
-        '
-        
-        rm -f nginx.conf
-
-    - name: Configure Nginx (if Let's Encrypt failed)
-      if: failure()
-      run: |
-        echo "⚙️  Configuring Nginx with self-signed certificate..."
-        
-        ssh deploy-server "
-          # Создаем самоподписной сертификат
-          echo '🔐 Generating self-signed certificate...'
-          sudo mkdir -p /etc/ssl/certs
-          sudo mkdir -p /etc/ssl/private
-          
-          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout /etc/ssl/private/birthday-invitation.key \
-            -out /etc/ssl/certs/birthday-invitation.crt \
-            -subj \"/C=RU/ST=Moscow/L=Moscow/O=Birthday/CN=${{ secrets.DOMAIN }}\"
-          
-          sudo chmod 644 /etc/ssl/certs/birthday-invitation.crt
-          sudo chmod 600 /etc/ssl/private/birthday-invitation.key
-          
-          echo '✅ Self-signed certificate created'
-        "
-        
-        # Создаем Nginx конфиг с самоподписным сертификатом
-        cat > nginx-selfsigned.conf << EOF
-        # Birthday Invitation Application
-        # Generated: $(date)
-        # Build: ${{ needs.build.outputs.build_id }}
-        
-        server {
-            listen 80;
-            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            return 301 https://\$server_name\$request_uri;
-        }
-        
-        server {
-            listen 443 ssl http2;
-            server_name ${{ secrets.DOMAIN }} www.${{ secrets.DOMAIN }};
-            
-            # SSL Configuration (self-signed)
-            ssl_certificate /etc/ssl/certs/birthday-invitation.crt;
-            ssl_certificate_key /etc/ssl/private/birthday-invitation.key;
-            ssl_protocols TLSv1.2 TLSv1.3;
-            ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
-            ssl_prefer_server_ciphers off;
-            ssl_session_cache shared:SSL:10m;
-            ssl_session_timeout 10m;
-            
-            # Security Headers
-            add_header X-Frame-Options "SAMEORIGIN" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-XSS-Protection "1; mode=block" always;
-            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-            
-            # Root directory
-            root ${{ env.DEPLOY_PATH }}/dist;
-            index index.html;
-            
-            # Logging
-            access_log ${{ env.DEPLOY_PATH }}/logs/nginx-access.log;
-            error_log ${{ env.DEPLOY_PATH }}/logs/nginx-error.log;
-            
-            # Gzip Compression
+            # Gzip сжатие
             gzip on;
             gzip_vary on;
             gzip_min_length 1024;
             gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
             
-            # SPA routing
+            # Заголовки безопасности
+            add_header X-Frame-Options 'SAMEORIGIN' always;
+            add_header X-Content-Type-Options 'nosniff' always;
+            add_header X-XSS-Protection '1; mode=block' always;
+            
+            # Обработка SPA роутинга
             location / {
                 try_files \$uri \$uri/ /index.html;
-                expires -1;
             }
             
-            # Cache static assets
-            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp)$ {
+            # Кэширование статики
+            location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg)\$ {
                 expires 1y;
-                add_header Cache-Control "public, immutable";
-                access_log off;
+                add_header Cache-Control 'public, immutable';
             }
             
-            # Health check endpoint
+            # Блокировка доступа к скрытым файлам
+            location ~ /\\. {
+                deny all;
+            }
+            
+            # Health check
             location /health {
                 access_log off;
-                return 200 "healthy\n";
+                return 200 'healthy\\n';
                 add_header Content-Type text/plain;
             }
             
             # Version endpoint
             location /version {
-                alias ${{ env.DEPLOY_PATH }}/dist/.version;
+                alias /usr/share/nginx/html/.version;
                 access_log off;
                 add_header Content-Type text/plain;
             }
             
-            # Block access to sensitive files
-            location ~ /\. {
-                deny all;
-                access_log off;
-                log_not_found off;
-            }
-            
-            location ~* \.(log|sql|db|bak|old|orig)$ {
-                deny all;
-                access_log off;
-                log_not_found off;
-            }
-            
-            # Custom error pages
+            # Страница ошибок
             error_page 404 /index.html;
             error_page 500 502 503 504 /50x.html;
             location = /50x.html {
                 root /usr/share/nginx/html;
             }
         }
-        EOF
-        
-        scp nginx-selfsigned.conf deploy-server:/tmp/nginx-selfsigned.conf
+        NGINX_CONFIG
+        "
+    
+    - name: Login to GitHub Container Registry on server
+      run: |
+        echo "🔐 Logging in to GitHub Container Registry on server..."
         
         ssh deploy-server "
-          echo 'Applying Nginx configuration with self-signed certificate...'
-          
-          # Отключаем дефолтный сайт
-          sudo rm -f ${{ env.NGINX_SITES_ENABLED }}/default 2>/dev/null || true
-          
-          # Применяем конфиг
-          sudo cp /tmp/nginx-selfsigned.conf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }}
-          sudo ln -sf ${{ env.NGINX_SITES_AVAILABLE }}/${{ env.NGINX_SITE_NAME }} ${{ env.NGINX_SITES_ENABLED }}/
-          
-          # Тестируем и перезагружаем
-          sudo nginx -t && sudo systemctl reload nginx
-          echo '✅ Nginx configured with self-signed certificate'
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ env.DOCKER_REGISTRY }} \
+            -u '${{ github.actor }}' \
+            --password-stdin
         "
+    
+    - name: Generate SSL certificates on server
+      run: |
+        echo "🔐 Generating SSL certificates on server..."
         
-        rm -f nginx-selfsigned.conf
+        ssh deploy-server "
+          cd ~/app
+          
+          # Generate SSL certificates if not exist
+          if ! docker volume inspect ssl-certs > /dev/null 2>&1; then
+            echo 'Creating SSL certificates...'
+            /tmp/generate-ssl.sh
+          else
+            echo 'SSL certificates already exist, skipping generation...'
+          fi
+        "
+    
+    - name: Deploy with Docker Compose
+      run: |
+        echo "🚀 Deploying with Docker Compose..."
+        
+        ssh deploy-server "
+          cd ~/app
+          
+          # Stop and remove old container if exists
+          docker-compose -f /tmp/docker-compose.prod.yml down || true
+          
+          # Pull latest image
+          docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          
+          # Start new container
+          docker-compose -f /tmp/docker-compose.prod.yml up -d
+          
+          # Verify container is running
+          echo '=== Container Status ==='
+          docker ps --filter 'name=${{ env.APP_NAME }}'
+          
+          echo '=== Container Logs (last 10 lines) ==='
+          docker logs ${{ env.APP_NAME }}-prod --tail 10 2>&1 || echo 'No logs yet'
+        "
     
     - name: Verify deployment
       run: |
         echo "🔍 Verifying deployment..."
         
-        # Ждем немного чтобы nginx перезагрузился
-        sleep 5
-        
-        # Проверяем доступность приложения
-        echo "Testing application availability..."
+        sleep 10
         
         ssh deploy-server "
-          echo '=== Local curl test ==='
-          curl -s -o /dev/null -w '%{http_code}' https://localhost/health
-          echo ' - Health check'
-          
-          curl -s -o /dev/null -w '%{http_code}' https://localhost/
-          echo ' - Home page'
-          
-          curl -s https://localhost/version
-          echo ' - Version'
+          echo '=== Docker Container Status ==='
+          docker ps --filter 'name=${{ env.APP_NAME }}' --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'
           
           echo ''
-          echo '=== Deployment verification ==='
-          echo 'Build ID deployed:'
-          cat ${{ env.DEPLOY_PATH }}/dist/.version 2>/dev/null || echo 'Not found'
+          echo '=== Application Health Check ==='
+          curl -f http://localhost/health || echo 'Health check failed'
           
           echo ''
-          echo '=== Nginx verification ==='
-          sudo nginx -t 2>&1
-          echo ''
-          sudo systemctl status nginx --no-pager | grep -E '(Active|Main PID|Status)'
+          echo '=== Nginx Configuration Test ==='
+          docker exec ${{ env.APP_NAME }}-prod nginx -t 2>&1
           
           echo ''
-          echo '=== Disk usage ==='
-          df -h ${{ env.DEPLOY_PATH }}
+          echo '=== Disk Usage ==='
+          docker system df
         "
         
-        # Внешняя проверка (опционально)
-        echo "=== External verification ==="
+        # External check
+        echo ''
+        echo "=== External Verification ==="
         echo "Application should be available at:"
-        echo "  • https://${{ secrets.DOMAIN }}"
-        echo "  • http://${{ secrets.SERVER_IP }} (HTTP redirect to HTTPS)"
-        echo ""
-        echo "✅ Deployment verification completed"
+        echo "  • http://${{ secrets.SERVER_IP }}"
+        echo "  • https://${{ secrets.DOMAIN }} (if DNS configured)"
+        echo ''
+        echo "To check SSL certificate:"
+        echo "  openssl s_client -connect ${{ secrets.SERVER_IP }}:443 -servername ${{ secrets.DOMAIN }}"
 
   # ==================== POST-DEPLOYMENT ====================
   post_deploy:
     name: 📊 Post-Deployment
     runs-on: ubuntu-latest
-    needs: [validate, security, build, deploy]
+    needs: [deploy]
     if: always()
-    timeout-minutes: 10
     
     steps:
-    - name: Checkout for git info
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Generate deployment report
-      env:
-        DEPLOY_RESULT: ${{ needs.deploy.result }}
-        BUILD_ID: ${{ needs.build.outputs.build_id }}
-        BUILD_VERSION: ${{ needs.build.outputs.version }}
-        SERVER_IP: ${{ secrets.SERVER_IP }}
-        DOMAIN: ${{ secrets.DOMAIN }}
-        DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
-        VALIDATE_RESULT: ${{ needs.validate.result }}
-        SECURITY_RESULT: ${{ needs.security.result }}
-        BUILD_RESULT: ${{ needs.build.result }}
-        GITHUB_SERVER_URL: ${{ github.server_url }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
-        GITHUB_RUN_ID: ${{ github.run_id }}
-      run: |
-        echo "📊 Generating deployment report..."
-        
-        # Собираем информацию
-        DEPLOYMENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        GIT_COMMIT=$(git log -1 --pretty=format:"%H")
-        GIT_AUTHOR=$(git log -1 --pretty=format:"%an")
-        GIT_MESSAGE=$(git log -1 --pretty=format:"%s")
-        BRANCH="${GITHUB_REF#refs/heads/}"
-        
-        cat > deployment-report.md << EOF
-        # Deployment Report
-        
-        ## Summary
-        - **Application**: birthday-invitation
-        - **Environment**: Production
-        - **Status**: $DEPLOY_RESULT
-        - **Deployed At**: $DEPLOYMENT_TIME
-        
-        ## Build Information
-        - **Build ID**: $BUILD_ID
-        - **Version**: $BUILD_VERSION
-        - **Commit**: $GIT_COMMIT
-        - **Author**: $GIT_AUTHOR
-        - **Message**: $GIT_MESSAGE
-        - **Branch**: $BRANCH
-        
-        ## Deployment Details
-        - **Server**: $SERVER_IP
-        - **Domain**: $DOMAIN
-        - **Deploy Path**: $DEPLOY_PATH
-        - **Backup Created**: Yes
-        
-        ## Quality Gates
-        - **Validation**: $VALIDATE_RESULT
-        - **Security Scan**: $SECURITY_RESULT
-        - **Build**: $BUILD_RESULT
-        - **Deploy**: $DEPLOY_RESULT
-        
-        ## Links
-        - **Application**: https://$DOMAIN
-        - **Repository**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY
-        - **Workflow Run**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-        
-        ## Next Steps
-        1. Monitor application logs
-        2. Test critical functionality
-        3. Update monitoring dashboards
-        EOF
-        
-        echo "✅ Deployment report generated"
-        cat deployment-report.md
-    
     - name: Send deployment notification
       env:
-        BUILD_STATUS: ${{ needs.build.result }}
         DEPLOY_STATUS: ${{ needs.deploy.result }}
         APP_NAME: ${{ env.APP_NAME }}
-        BUILD_VERSION: ${{ needs.build.outputs.version }}
-        BUILD_ID: ${{ needs.build.outputs.build_id }}
         SERVER_IP: ${{ secrets.SERVER_IP }}
         DOMAIN: ${{ secrets.DOMAIN }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        VALIDATE_RESULT: ${{ needs.validate.result }}
-        SECURITY_RESULT: ${{ needs.security.result }}
-        BUILD_RESULT: ${{ needs.build.result }}
-        DEPLOY_RESULT: ${{ needs.deploy.result }}
-        GITHUB_SERVER_URL: ${{ github.server_url }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
-        GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         echo "📨 Sending deployment notification..."
         
-        # Получаем информацию о коммите
-        COMMIT_SHA="${GITHUB_SHA:0:7}"
-        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
-        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
-        BRANCH="${GITHUB_REF#refs/heads/}"
-        
-        # Определяем статус и иконки
-        if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
-          EMOJI="🎉"
-          STATUS_TEXT="<b>УСПЕШНО</b> ✅"
-          STATUS_ICON="🟢"
-        elif [ "$DEPLOY_STATUS" = "failure" ]; then
-          EMOJI="❌"
-          STATUS_TEXT="<b>ОШИБКА ДЕПЛОЯ</b> 🔴"
-          STATUS_ICON="🔴"
-        elif [ "$BUILD_STATUS" = "failure" ]; then
-          EMOJI="🚨"
-          STATUS_TEXT="<b>ОШИБКА СБОРКИ</b> 🟠"
-          STATUS_ICON="🟠"
+        if [ "$DEPLOY_STATUS" = "success" ]; then
+          STATUS_EMOJI="✅"
+          STATUS_TEXT="<b>УСПЕШНО</b>"
         else
-          EMOJI="⚠️"
-          STATUS_TEXT="<b>НЕИЗВЕСТНО</b> ⚪"
-          STATUS_ICON="⚪"
+          STATUS_EMOJI="❌"
+          STATUS_TEXT="<b>ОШИБКА</b>"
         fi
         
-        # Формируем сообщение с правильным форматированием
-        # Используем двойные кавычки для подстановки переменных
         cat > message.txt << EOF
-        $EMOJI <b>Деплой $APP_NAME</b>
+        🐳 <b>Docker Deploy $APP_NAME</b>
         
-        $STATUS_ICON Статус: $STATUS_TEXT
-        📦 Версия: <code>$BUILD_VERSION</code>
-        🏷️ Сборка: <code>$BUILD_ID</code>
-        
-        📝 <b>Информация о коммите:</b>
-        └─ Ветка: <code>$BRANCH</code>
-        └─ Коммит: <code>$COMMIT_SHA</code>
-        └─ Автор: $COMMIT_AUTHOR
-        └─ Сообщение: $COMMIT_MESSAGE
+        $STATUS_EMOJI Статус: $STATUS_TEXT
+        📦 Режим: Docker Container
+        🏷️ Тег: latest
         
         🌐 <b>Доступ к приложению:</b>
-        • https://$DOMAIN
         • http://$SERVER_IP
+        • https://$DOMAIN
         
         🔧 <b>Проверка здоровья:</b>
-        • https://$DOMAIN/health
-        • https://$DOMAIN/version
+        • http://$SERVER_IP/health
+        • http://$SERVER_IP/version
         
-        📊 <b>Статусы:</b>
-        • Валидация: $VALIDATE_RESULT
-        • Безопасность: $SECURITY_RESULT
-        • Сборка: $BUILD_RESULT
-        • Деплой: $DEPLOY_RESULT
+        📊 <b>Команды для управления:</b>
+        \`\`\`bash
+        # Просмотр логов
+        docker logs $APP_NAME-prod
+        
+        # Перезапуск контейнера
+        docker restart $APP_NAME-prod
+        
+        # Просмотр статистики
+        docker stats $APP_NAME-prod
+        \`\`\`
         
         🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>
         EOF
         
-        # Читаем сообщение
         MESSAGE=$(cat message.txt)
-        
-        # Отправляем в Telegram
-        echo "Sending to Telegram..."
         
         curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
           -H "Content-Type: application/json" \
@@ -992,79 +478,8 @@ jobs:
             \"chat_id\": \"$TELEGRAM_CHAT_ID\",
             \"text\": \"$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g')\",
             \"parse_mode\": \"HTML\",
-            \"disable_web_page_preview\": true,
-            \"reply_markup\": {
-              \"inline_keyboard\": [
-                [
-                  {\"text\": \"🌐 Открыть приложение\", \"url\": \"https://$DOMAIN\"},
-                  {\"text\": \"📊 Посмотреть логи\", \"url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}
-                ]
-              ]
-            }
+            \"disable_web_page_preview\": true
           }"
         
-        echo "✅ Notification sent to Telegram"
+        echo "✅ Notification sent"
         rm -f message.txt
-  # ==================== CLEANUP ====================
-  cleanup:
-    name: 🧹 Cleanup
-    runs-on: ubuntu-latest
-    needs: [post_deploy, build, validate, security, deploy, ]
-    if: always()
-    
-    steps:
-    - name: Cleanup old artifacts
-      uses: actions/github-script@v7
-      with:
-        script: |
-          // Удаляем старые артефакты (оставляем последние 5)
-          const artifacts = await github.rest.actions.listArtifactsForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            per_page: 100
-          });
-          
-          const buildArtifacts = artifacts.data.artifacts
-            .filter(artifact => artifact.name.startsWith('build-'))
-            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-          
-          // Оставляем последние 5 артефактов
-          const artifactsToDelete = buildArtifacts.slice(5);
-          
-          for (const artifact of artifactsToDelete) {
-            console.log(`Deleting old artifact: ${artifact.name}`);
-            await github.rest.actions.deleteArtifact({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              artifact_id: artifact.id
-            });
-          }
-    
-    - name: Summary
-      if: always()
-      run: |
-        echo "📋 ===== DEPLOYMENT PIPELINE SUMMARY ====="
-        echo ""
-        echo "🏗️  Application: birthday-invitation"
-        echo "🚀 Trigger: ${{ github.event_name }}"
-        echo "👤 Actor: ${{ github.actor }}"
-        echo "🌿 Branch: ${GITHUB_REF#refs/heads/}"
-        echo ""
-        echo "📊 Job Results:"
-        echo "  🔍 Validate: ${{ needs.validate.result }}"
-        echo "  🔒 Security: ${{ needs.security.result }}"
-        echo "  🏗️  Build: ${{ needs.build.result }}"
-        echo "  🚀 Deploy: ${{ needs.deploy.result }}"
-        echo "  📊 Post-Deploy: ${{ needs.post_deploy.result }}"
-        echo ""
-        echo "🌐 Application URL: https://${{ secrets.DOMAIN }}"
-        echo "📁 Build ID: ${{ needs.build.outputs.build_id }}"
-        echo ""
-        
-        if [ "${{ job.status }}" = "success" ]; then
-          echo "✅ Deployment pipeline completed successfully!"
-          echo "🎉 Your application is now live!"
-        else
-          echo "❌ Deployment pipeline failed!"
-          echo "🔍 Check the logs above for details."
-        fi
