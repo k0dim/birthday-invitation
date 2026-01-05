@@ -74,68 +74,68 @@ jobs:
           docker push ghcr.io/${{ github.repository }}/app:${{ github.sha }}
 
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: [build]
-    outputs:
-      result: ${{ job.status }}
-    steps:
-      - name: Deploy (blue/green)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_IP }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            set -e
+deploy:
+  runs-on: ubuntu-latest
+  needs: [build]
+  outputs:
+    result: ${{ job.status }}
+  steps:
+    - name: Deploy (blue/green)
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.SERVER_IP }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          set -e
 
-            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+          IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
 
-            echo "🔑 Logging into GHCR..."
-            docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} -p ${{ secrets.GHCR_TOKEN }}
-            docker pull $IMAGE
+          echo "🔑 Logging into GHCR..."
+          docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} -p ${{ secrets.GHCR_TOKEN }}
+          docker pull $IMAGE
 
-            echo "📦 Determining current deployment..."
-            CURRENT=$(docker ps --format "{{.Names}}" | grep app_ || true)
+          echo "📦 Determining current deployment..."
+          CURRENT=$(docker ps --format "{{.Names}}" | grep app_ || true)
 
-            if [ "$CURRENT" = "app_blue" ]; then
-              NEW=app_green
-              OLD=app_blue
-            else
-              NEW=app_blue
-              OLD=app_green
+          if [ "$CURRENT" = "app_blue" ]; then
+            NEW=app_green
+            OLD=app_blue
+          else
+            NEW=app_blue
+            OLD=app_green
+          fi
+
+          # Удаляем новый контейнер, если он остался с прошлых запусков
+          if docker ps -a --format "{{.Names}}" | grep -q "^$NEW$"; then
+            echo "⚠️ Removing existing $NEW container..."
+            docker rm -f $NEW
+          fi
+
+          echo "🚀 Starting new container $NEW..."
+          docker run -d \
+            --name $NEW \
+            --network backend \
+            -e GIT_COMMIT=${{ github.sha }} \
+            $IMAGE
+
+          echo "🔍 Waiting for healthcheck..."
+          for i in {1..10}; do
+            if docker exec $NEW wget -qO- http://localhost:3000/health; then
+              echo "✅ Healthcheck passed"
+              break
             fi
+            sleep 3
+          done
 
-            # Удаляем новый контейнер, если он остался с прошлых запусков
-            if docker ps -a --format "{{.Names}}" | grep -q "^$NEW$"; then
-              echo "⚠️ Removing existing $NEW container..."
-              docker rm -f $NEW
-            fi
+          echo "🔄 Switching nginx upstream..."
+          sed -i "s/$OLD/$NEW/g" /opt/birthday/nginx/upstream.conf
+          docker exec birthday_nginx nginx -s reload
 
-            echo "🚀 Starting new container $NEW..."
-            docker run -d \
-              --name $NEW \
-              --network backend \
-              -e GIT_COMMIT=${{ github.sha }} \
-              $IMAGE
+          echo "🗑 Removing old container $OLD..."
+          docker rm -f $OLD || true
 
-            echo "🔍 Waiting for healthcheck..."
-            for i in {1..10}; do
-              if docker exec $NEW wget -qO- http://localhost:3000/health; then
-                echo "✅ Healthcheck passed"
-                break
-              fi
-              sleep 3
-            done
-
-            echo "🔄 Switching nginx upstream..."
-            sed -i "s/$OLD/$NEW/g" /opt/birthday/nginx/upstream.conf
-            docker exec birthday_nginx nginx -s reload
-
-            echo "🗑 Removing old container $OLD..."
-            docker rm -f $OLD || true
-
-            echo "✅ Deployment completed: $NEW is live"
+          echo "✅ Deployment completed: $NEW is live"
 
 
   notify:
