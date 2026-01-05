@@ -734,6 +734,10 @@ jobs:
       env:
         BUILD_STATUS: ${{ needs.build.result }}
         DEPLOY_STATUS: ${{ needs.deploy.result }}
+        COMMIT_SHA: ${GITHUB_SHA:0:7}
+        COMMIT_MESSAGE: $(git log -1 --pretty=%B | head -n1)
+        COMMIT_AUTHOR: $(git log -1 --pretty=%an)
+        BRANCH: ${GITHUB_REF#refs/heads/}
       run: |
         echo "📨 Sending deployment notification..."
         
@@ -756,41 +760,40 @@ jobs:
           STATUS_ICON="⚪"
         fi
         
-        # Получаем информацию о коммите
-        COMMIT_SHA="${GITHUB_SHA:0:7}"
-        COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
-        COMMIT_AUTHOR=$(git log -1 --pretty=%an)
-        BRANCH="${GITHUB_REF#refs/heads/}"
+        # Формируем сообщение с правильным форматированием
+        cat > message.txt << 'EOF'
+        $EMOJI <b>Деплой ${{ env.APP_NAME }}</b>
         
-        # Формируем сообщение
-        MESSAGE="$EMOJI <b>Деплой ${{ env.APP_NAME }}</b>
-
-$STATUS_ICON Статус: $STATUS_TEXT
-📦 Версия: <code>${{ needs.build.outputs.version }}</code>
-🏷️  Сборка: <code>${{ needs.build.outputs.build_id }}</code>
-
-📝 <b>Информация о коммите:</b>
-└─ Ветка: <code>$BRANCH</code>
-└─ Коммит: <code>$COMMIT_SHA</code>
-└─ Автор: $COMMIT_AUTHOR
-└─ Сообщение: $COMMIT_MESSAGE
-
-🌐 <b>Доступ к приложению:</b>
-• https://${{ secrets.DOMAIN }}
-• http://${{ secrets.SERVER_IP }}
-
-🔧 <b>Проверка здоровья:</b>
-• https://${{ secrets.DOMAIN }}/health
-• https://${{ secrets.DOMAIN }}/version
-
-📊 <b>Статусы:</b>
-• Валидация: ${{ needs.validate.result }}
-• Безопасность: ${{ needs.security.result }}
-• Сборка: ${{ needs.build.result }}
-• Деплой: ${{ needs.deploy.result }}
-
-🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>"
-
+        $STATUS_ICON Статус: $STATUS_TEXT
+        📦 Версия: <code>${{ needs.build.outputs.version }}</code>
+        🏷️ Сборка: <code>${{ needs.build.outputs.build_id }}</code>
+        
+        📝 <b>Информация о коммите:</b>
+        └─ Ветка: <code>$BRANCH</code>
+        └─ Коммит: <code>$COMMIT_SHA</code>
+        └─ Автор: $COMMIT_AUTHOR
+        └─ Сообщение: $COMMIT_MESSAGE
+        
+        🌐 <b>Доступ к приложению:</b>
+        • https://${{ secrets.DOMAIN }}
+        • http://${{ secrets.SERVER_IP }}
+        
+        🔧 <b>Проверка здоровья:</b>
+        • https://${{ secrets.DOMAIN }}/health
+        • https://${{ secrets.DOMAIN }}/version
+        
+        📊 <b>Статусы:</b>
+        • Валидация: ${{ needs.validate.result }}
+        • Безопасность: ${{ needs.security.result }}
+        • Сборка: ${{ needs.build.result }}
+        • Деплой: ${{ needs.deploy.result }}
+        
+        🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>
+        EOF
+        
+        # Подставляем переменные
+        MESSAGE=$(envsubst < message.txt)
+        
         # Отправляем в Telegram
         echo "Sending to Telegram..."
         
@@ -798,7 +801,7 @@ $STATUS_ICON Статус: $STATUS_TEXT
           -H "Content-Type: application/json" \
           -d "{
             \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-            \"text\": \"${MESSAGE}\",
+            \"text\": \"$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g')\",
             \"parse_mode\": \"HTML\",
             \"disable_web_page_preview\": true,
             \"reply_markup\": {
@@ -812,23 +815,7 @@ $STATUS_ICON Статус: $STATUS_TEXT
           }"
         
         echo "✅ Notification sent to Telegram"
-    
-    - name: Update deployment status
-      if: always()
-      run: |
-        echo "🏷️  Updating deployment status..."
-        
-        if [ "${{ needs.deploy.result }}" = "success" ]; then
-          echo "✅ Deployment successful"
-          # Здесь можно добавить интеграцию с внешними системами мониторинга
-          # Например: Datadog, New Relic, Sentry и т.д.
-        else
-          echo "❌ Deployment failed"
-          # Отправка алертов в другие системы
-        fi
-        
-        echo "Deployment pipeline completed with status: ${{ job.status }}"
-
+        rm -f message.txt
   # ==================== CLEANUP ====================
   cleanup:
     name: 🧹 Cleanup
