@@ -6,6 +6,7 @@ permissions:
   actions: write
   deployments: write
   statuses: write
+  packages: write 
 
 on:
   push:
