@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  app_blue:
+    image: dimaparty/app:${IMAGE_TAG}
+    networks: [backend]
+
+  app_green:
+    image: dimaparty/app:${IMAGE_TAG}
+    networks: [backend]
+
+  nginx:
+    image: dimaparty/nginx:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d
+      - letsencrypt:/etc/letsencrypt
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  letsencrypt:
