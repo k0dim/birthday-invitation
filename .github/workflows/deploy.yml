@@ -453,7 +453,6 @@ jobs:
         
         # Копируем файлы сборки
         cp -r dist/* $DEPLOY_TEMP_DIR/
-        cp build-manifest.json $DEPLOY_TEMP_DIR/
         
         # Создаем файл версии
         echo "${{ needs.build.outputs.build_id }}" > $DEPLOY_TEMP_DIR/.version
