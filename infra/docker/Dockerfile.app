@@ -3,10 +3,10 @@ FROM node:20-alpine as build
 
 WORKDIR /app
 
-# Копируем package.json и package-lock.json
+# Копируем package.json
 COPY package*.json ./
 
-# Устанавливаем ВСЕ зависимости (включая devDependencies)
+# Устанавливаем все зависимости (нужен vite для сборки)
 RUN npm ci
 
 # Копируем исходный код
@@ -22,37 +22,21 @@ RUN VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\([
     echo "commit=${GITHUB_SHA:-local-build}" >> /app/dist/build-info.txt && \
     echo "$(date -u +'%Y%m%d%H%M%S')" > /app/dist/.version
 
-# Production stage
+# Production stage - используем Node.js для health check
 FROM node:20-alpine
 
 WORKDIR /app
 
-# Копируем собранное приложение
+# Копируем только dist
 COPY --from=build /app/dist ./dist
 
-# Создаем простой сервер
+# Создаем простой health check сервер
 RUN echo 'const http = require("http"); \
     const fs = require("fs"); \
     const path = require("path"); \
     const PORT = process.env.PORT || 3000; \
     \
-    const mimeTypes = { \
-      ".html": "text/html", \
-      ".js": "text/javascript", \
-      ".css": "text/css", \
-      ".json": "application/json", \
-      ".png": "image/png", \
-      ".jpg": "image/jpeg", \
-      ".gif": "image/gif", \
-      ".svg": "image/svg+xml", \
-      ".ico": "image/x-icon" \
-    }; \
-    \
     const server = http.createServer((req, res) => { \
-      const filePath = req.url === "/" ? "/index.html" : req.url; \
-      const extname = path.extname(filePath); \
-      let contentType = mimeTypes[extname] || "application/octet-stream"; \
-      \
       if (req.url === "/health") { \
         res.writeHead(200, { "Content-Type": "text/plain" }); \
         res.end("OK"); \
@@ -71,36 +55,14 @@ RUN echo 'const http = require("http"); \
         return; \
       } \
       \
-      const fullPath = path.join(__dirname, filePath); \
-      \
-      fs.readFile(fullPath, (error, content) => { \
-        if (error) { \
-          if (error.code === "ENOENT") { \
-            fs.readFile(path.join(__dirname, "/index.html"), (err, content) => { \
-              if (err) { \
-                res.writeHead(500); \
-                res.end("Server Error"); \
-              } else { \
-                res.writeHead(200, { "Content-Type": "text/html" }); \
-                res.end(content, "utf-8"); \
-              } \
-            }); \
-          } else { \
-            res.writeHead(500); \
-            res.end("Server Error: " + error.code); \
-          } \
-        } else { \
-          res.writeHead(200, { "Content-Type": contentType }); \
-          res.end(content, "utf-8"); \
-        } \
-      }); \
+      res.writeHead(404); \
+      res.end("Not found"); \
     }); \
     \
     server.listen(PORT, () => { \
-      console.log(`Server running on port ${PORT}`); \
+      console.log(`Health check server running on port ${PORT}`); \
     });' > server.js
 
-# Открываем порт
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
