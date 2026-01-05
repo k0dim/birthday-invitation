@@ -106,9 +106,13 @@ jobs:
               OLD=app_green
             fi
 
-            # Удаляем новый контейнер, если он остался с прошлых запусков
+            # --- Сеть backend ---
+            echo "🌐 Ensuring Docker network 'backend' exists..."
+            docker network inspect backend >/dev/null 2>&1 || docker network create backend
+
+            # --- Удаляем старый контейнер NEW, если остался после предыдущего неудачного деплоя ---
             if docker ps -a --format "{{.Names}}" | grep -q "^$NEW$"; then
-              echo "⚠️ Removing existing $NEW container..."
+              echo "⚠️ Removing leftover $NEW container..."
               docker rm -f $NEW
             fi
 
