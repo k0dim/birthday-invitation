@@ -1,13 +1,15 @@
-FROM nginx:alpine
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
 
-# Копируем React сборку
-COPY dist /usr/share/nginx/html
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=builder /app ./
 
-# Копируем статические файлы для /health и /version
-COPY infra/nginx/html/ /usr/share/nginx/html/
-
-# Копируем конфиги Nginx
-COPY infra/nginx/upstream.conf /etc/nginx/conf.d/upstream.conf
-COPY infra/nginx/default.conf /etc/nginx/conf.d/default.conf
-
-EXPOSE 80
+# Healthcheck endpoint
+ENV PORT=3000
+EXPOSE 3000
+CMD ["node", "server.js"]  # предполагаем, что server.js запускает сайт

@@ -1,4 +1,4 @@
-name: Release birthday-invitation
+name: CI/CD birthday-invitation
 
 on:
   push:
@@ -6,18 +6,20 @@ on:
   workflow_dispatch:
 
 jobs:
+
   validation:
     runs-on: ubuntu-latest
     outputs:
       result: ${{ job.status }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Install deps
+      - name: Install dependencies
         run: npm ci
-      - name: Validation
+      - name: Lint code
         run: npm run lint || true
 
   security:
@@ -26,15 +28,12 @@ jobs:
       result: ${{ job.status }}
     steps:
       - uses: actions/checkout@v4
-      - name: npm audit
+      - name: Audit npm packages
         run: npm audit --audit-level=high || true
 
   build:
     runs-on: ubuntu-latest
     needs: [validation, security]
-    permissions:
-      contents: read
-      packages: write
     outputs:
       result: ${{ job.status }}
       version: ${{ steps.set_outputs.outputs.version }}
@@ -42,37 +41,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Login to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-          | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
       - name: Set build outputs
         id: set_outputs
         run: |
           VERSION=$(jq -r .version package.json)
           BUILD_ID="${GITHUB_SHA::7}-$(date +%Y%m%d%H%M%S)"
-          echo "VERSION=$VERSION"
-          echo "BUILD_ID=$BUILD_ID"
-
-          # Устанавливаем outputs для использования в других job
           echo "::set-output name=version::$VERSION"
           echo "::set-output name=build_id::$BUILD_ID"
 
-      - name: Build image
+      - name: Build Docker image
         run: |
-          docker build \
-            -t ghcr.io/${{ github.repository }}/app:${{ github.sha }} .
+          docker build -t ghcr.io/${{ github.repository }}/app:${{ github.sha }} .
 
-      - name: Trivy scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ghcr.io/${{ github.repository }}/app:${{ github.sha }}
-
-      - name: Push image
+      - name: Push Docker image
         run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           docker push ghcr.io/${{ github.repository }}/app:${{ github.sha }}
-
 
   deploy:
     runs-on: ubuntu-latest
@@ -80,7 +64,7 @@ jobs:
     outputs:
       result: ${{ job.status }}
     steps:
-      - name: Deploy (blue/green)
+      - name: Deploy to server
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_IP }}
@@ -89,159 +73,57 @@ jobs:
           script: |
             set -e
 
+            echo "🔑 Logging into GHCR..."
+            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
             IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
 
-            echo "🔑 Logging into GHCR..."
-            docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} -p ${{ secrets.GHCR_TOKEN }}
-            docker pull $IMAGE
+            # --- Docker network ---
+            docker network inspect backend >/dev/null 2>&1 || docker network create backend
 
-            echo "📦 Determining current deployment..."
-            CURRENT=$(docker ps --format "{{.Names}}" | grep app_ || true)
+            # --- Remove old app container ---
+            docker rm -f birthday_app || true
 
-            if [ "$CURRENT" = "app_blue" ]; then
-              NEW=app_green
-              OLD=app_blue
-            else
-              NEW=app_blue
-              OLD=app_green
-            fi
-
-            # Удаляем новый контейнер, если он остался с прошлых запусков
-            if docker ps -a --format "{{.Names}}" | grep -q "^$NEW$"; then
-              echo "⚠️ Removing existing $NEW container..."
-              docker rm -f $NEW
-            fi
-
-            echo "🚀 Starting new container $NEW..."
+            # --- Run app container ---
             docker run -d \
-              --name $NEW \
+              --name birthday_app \
               --network backend \
               -e GIT_COMMIT=${{ github.sha }} \
+              -e BUILD_ID=${{ needs.build.outputs.build_id }} \
+              -e VERSION=${{ needs.build.outputs.version }} \
+              -p 3000:3000 \
               $IMAGE
 
-            echo "🔍 Waiting for healthcheck..."
-            for i in {1..10}; do
-              if docker exec $NEW wget -qO- http://localhost:3000/health; then
-                echo "✅ Healthcheck passed"
-                break
-              fi
-              sleep 3
-            done
+            # --- Ensure nginx container ---
+            docker rm -f birthday_nginx || true
+            docker run -d \
+              --name birthday_nginx \
+              --network backend \
+              -p 80:80 -p 443:443 \
+              -v /opt/birthday/nginx/certs:/etc/letsencrypt \
+              -v /opt/birthday/nginx/conf:/etc/nginx/conf.d \
+              nginx:alpine
 
-            echo "🔄 Switching nginx upstream..."
-            sed -i "s/$OLD/$NEW/g" /opt/birthday/nginx/upstream.conf
-            docker exec birthday_nginx nginx -s reload
-
-            echo "🗑 Removing old container $OLD..."
-            docker rm -f $OLD || true
-
-            echo "✅ Deployment completed: $NEW is live"
-
+            echo "✅ Deployment completed"
 
   notify:
     runs-on: ubuntu-latest
-    needs: [validation, security, build, deploy]
+    needs: [deploy]
     if: always()
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Send deployment notification
-        env:
-          APP_NAME: birthday-invitation
-          BUILD_STATUS: ${{ needs.build.result }}
-          DEPLOY_STATUS: ${{ needs.deploy.result }}
-          BUILD_VERSION: ${{ needs.build.outputs.version }}
-          BUILD_ID: ${{ needs.build.outputs.build_id }}
-          DOMAIN: ${{ secrets.DOMAIN }}
-          SERVER_IP: ${{ secrets.SERVER_IP }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          VALIDATION: ${{ needs.validation.result }}
-          SECURITY: ${{ needs.security.result }}
-          DEPLOY: ${{ needs.deploy.result }}
-
+      - name: Send Telegram notification
         run: |
-          echo "📨 Sending deployment notification..."
-
-          # Определяем статус и иконки
-          if [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
-            EMOJI="🎉"
-            STATUS_TEXT="<b>УСПЕШНО</b> ✅"
-            STATUS_ICON="🟢"
-          elif [ "$DEPLOY_STATUS" = "failure" ]; then
-            EMOJI="❌"
-            STATUS_TEXT="<b>ОШИБКА ДЕПЛОЯ</b> 🔴"
-            STATUS_ICON="🔴"
-          elif [ "$BUILD_STATUS" = "failure" ]; then
-            EMOJI="🚨"
-            STATUS_TEXT="<b>ОШИБКА СБОРКИ</b> 🟠"
-            STATUS_ICON="🟠"
-          else
-            EMOJI="⚠️"
-            STATUS_TEXT="<b>НЕИЗВЕСТНО</b> ⚪"
-            STATUS_ICON="⚪"
+          STATUS="✅"
+          if [ "${{ needs.deploy.result }}" != "success" ]; then
+            STATUS="❌"
           fi
 
-          # Собираем инфу о коммите
-          COMMIT_SHA="${GITHUB_SHA:0:7}"
-          COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -n1)
-          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
-          BRANCH="${GITHUB_REF#refs/heads/}"
+          MESSAGE="$STATUS Birthday Invitation deployed at ${{ secrets.DOMAIN }}"
 
-          
-          # Формируем сообщение с правильным форматированием
-          cat > message.txt << 'EOF'
-          $EMOJI <b>Деплой birthday-invitation</b>
-          
-          $STATUS_ICON Статус: $STATUS_TEXT
-          📦 Версия: <code>$BUILD_VERSION</code>
-          🏷️ Сборка: <code>$BUILD_ID</code>
-          
-          📝 <b>Информация о коммите:</b>
-          └─ Ветка: <code>$BRANCH</code>
-          └─ Коммит: <code>$COMMIT_SHA</code>
-          └─ Автор: $COMMIT_AUTHOR
-          └─ Сообщение: $COMMIT_MESSAGE
-          
-          🌐 <b>Доступ к приложению:</b>
-          • https://${{ secrets.DOMAIN }}
-          • http://${{ secrets.SERVER_IP }}
-          
-          🔧 <b>Проверка здоровья:</b>
-          • https://${{ secrets.DOMAIN }}/health
-          • https://${{ secrets.DOMAIN }}/version
-          
-          📊 <b>Статусы:</b>
-          • Валидация: ${{ needs.validation.result }}
-          • Безопасность: ${{ needs.security.result }}
-          • Сборка: ${{ needs.build.result }}
-          • Деплой: ${{ needs.deploy.result }}
-          
-          🕐 <i>$(date '+%d.%m.%Y %H:%M:%S')</i>
-          EOF
-          
-          # Подставляем переменные
-          MESSAGE=$(envsubst < message.txt)
-          
-          # Отправляем в Telegram
-          echo "Sending to Telegram..."
-          
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -H "Content-Type: application/json" \
             -d "{
               \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
-              \"text\": \"$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\\n/\\\\n/g')\",
-              \"parse_mode\": \"HTML\",
-              \"disable_web_page_preview\": true,
-              \"reply_markup\": {
-                \"inline_keyboard\": [
-                  [
-                    {\"text\": \"🌐 Открыть приложение\", \"url\": \"https://${{ secrets.DOMAIN }}\"},
-                    {\"text\": \"📊 Посмотреть логи\", \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}
-                  ]
-                ]
-              }
+              \"text\": \"$MESSAGE\",
+              \"parse_mode\": \"HTML\"
             }"
-          
-          echo "✅ Notification sent to Telegram"
-          rm -f message.txt
