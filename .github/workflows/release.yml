@@ -64,9 +64,10 @@ jobs:
           docker build -t ghcr.io/${{ github.repository }}/nginx:${GITHUB_SHA} .
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ghcr.io/${{ github.repository }}/nginx:${GITHUB_SHA}
+        run: |
+          docker pull ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+          trivy image ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
 
       - name: Push Docker image
         run: |
