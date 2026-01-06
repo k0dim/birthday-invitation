@@ -1,34 +1,132 @@
-name: Container control
+name: CI/CD birthday-invitation
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      action:
-        description: start | stop | restart
-        required: true
 
 jobs:
-  control:
+
+  validation:
     runs-on: ubuntu-latest
+    outputs:
+      result: ${{ job.status }}
     steps:
-    - name: Control containers
-      uses: appleboy/ssh-action@v1
-      with:
-        host: ${{ secrets.SERVER_IP }}
-        username: ${{ secrets.DEPLOY_USER }}
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
-        script: |
-          case "${{ github.event.inputs.action }}" in
-            start)
-              docker start app_blue app_green nginx || true
-              ;;
-            stop)
-              docker stop app_blue app_green nginx || true
-              ;;
-            restart)
-              docker restart app_blue app_green nginx || true
-              ;;
-            *)
-              echo "Unknown action"
-              exit 1
-          esac
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint code
+        run: npm run lint || true
+
+  security:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit npm packages
+        run: npm audit --audit-level=high || true
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [validation, security]
+    outputs:
+      result: ${{ job.status }}
+      version: ${{ steps.set_outputs.outputs.version }}
+      build_id: ${{ steps.set_outputs.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set build outputs
+        id: set_outputs
+        run: |
+          VERSION=$(jq -r .version package.json)
+          BUILD_ID="${GITHUB_SHA::7}-$(date +%Y%m%d%H%M%S)"
+          echo "::set-output name=version::$VERSION"
+          echo "::set-output name=build_id::$BUILD_ID"
+
+      - name: Build Docker image
+        run: |
+          docker build -t ghcr.io/${{ github.repository }}/app:${{ github.sha }} .
+
+      - name: Scan Docker image with Trivy
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --severity HIGH,CRITICAL ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+      - name: Push Docker image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build]
+    outputs:
+      result: ${{ job.status }}
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+            echo "🔑 Logging into GHCR..."
+            docker login ghcr.io -u ${{ secrets.GITHUB_ACTOR }} -p ${{ secrets.GITHUB_TOKEN }}
+
+            echo "🌐 Ensuring Docker network 'backend' exists..."
+            docker network inspect backend >/dev/null 2>&1 || docker network create backend
+
+            echo "🗑 Removing old container if exists..."
+            docker rm -f birthday_app || true
+
+            echo "🚀 Starting new container..."
+            docker run -d \
+              --name birthday_app \
+              --network backend \
+              -e GIT_COMMIT=${{ github.sha }} \
+              -e BUILD_ID=${{ needs.build.outputs.build_id }} \
+              -e VERSION=${{ needs.build.outputs.version }} \
+              -p 3000:3000 \
+              $IMAGE
+
+            echo "🔍 Waiting for healthcheck..."
+            for i in {1..10}; do
+              if curl -sf http://localhost:3000/health; then
+                echo "✅ Healthcheck passed"
+                break
+              fi
+              sleep 3
+            done
+
+            echo "✅ Deployment completed"
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Send Telegram notification
+        run: |
+          STATUS="✅"
+          if [ "${{ needs.deploy.result }}" != "success" ]; then
+            STATUS="❌"
+          fi
+
+          MESSAGE="$STATUS Birthday Invitation deployed at ${{ secrets.DOMAIN }}"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+              \"text\": \"$MESSAGE\",
+              \"parse_mode\": \"HTML\"
+            }"
