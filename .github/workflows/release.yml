@@ -53,10 +53,11 @@ jobs:
         run: |
           docker build -t ghcr.io/${{ github.repository }}/app:${{ github.sha }} .
 
-      - name: Push Docker image
+      - name: Login to GHCR
         run: |
-          echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} --password-stdin
-          docker push ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+          | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
 
   deploy:
     runs-on: ubuntu-latest
