@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import dotenv from 'dotenv'
+dotenv.config({ path: '.env.local' })
+
 console.log('🔍 Простая проверка переменных окружения...\n')
 
 const requiredVars = [
@@ -11,13 +14,12 @@ let allPassed = true
 
 requiredVars.forEach(varName => {
   const value = process.env[varName]
-  
+
   if (value) {
-    // Маскируем токен
-    const maskedValue = varName.includes('TOKEN') 
+    const maskedValue = varName.includes('TOKEN')
       ? `${value.substring(0, 4)}...${value.substring(value.length - 4)}`
       : value
-    
+
     console.log(`✅ ${varName}: ${maskedValue} (длина: ${value.length})`)
   } else {
     console.log(`❌ ${varName}: НЕ НАЙДЕНА`)

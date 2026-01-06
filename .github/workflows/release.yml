@@ -76,7 +76,7 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build, validation, security]
     outputs:
       result: ${{ job.status }}
     steps:
@@ -140,6 +140,49 @@ jobs:
             docker rm -f $OLD || true
 
             echo "✅ Deployment completed: $NEW is live"
+
+      - name: Generate version.json
+        run: |
+          DEPLOY_RESULT="success"
+          DEPLOYMENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+
+          mkdir -p version
+          cat > version/version.json <<EOF
+          {
+            "Application": "birthday-invitation",
+            "Environment": "Production",
+            "Status": "$DEPLOY_RESULT",
+            "Deployed At": "$DEPLOYMENT_TIME",
+            "Build Information": {
+              "Build ID": "${{ needs.build.outputs.build_id }}",
+              "Version": "${{ needs.build.outputs.version }}",
+              "Commit": "${{ github.sha }}",
+              "Author": "${{ github.actor }}",
+              "Message": "${{ github.event.head_commit.message }}",
+              "Branch": "${{ github.ref_name }}"
+            },
+            "Deployment Details": {
+              "Server": "${{ secrets.SERVER_IP }}",
+              "Domain": "${{ secrets.DOMAIN }}",
+              "Deploy Path": "/opt/birthday",
+              "Backup Created": "Yes"
+            },
+            "Quality Gates": {
+              "Validation": "${{ needs.validation.result }}",
+              "Security Scan": "${{ needs.security.result }}",
+              "Build": "${{ needs.build.result }}",
+              "Deploy": "$DEPLOY_RESULT"
+            }
+          }
+          EOF
+      - name: Copy version.json to server
+        uses: appleboy/scp-action@v0.1.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "version/version.json"
+          target: "/opt/birthday/nginx/version.json"
 
 
   notify:
